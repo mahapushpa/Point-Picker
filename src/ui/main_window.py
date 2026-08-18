@@ -12,9 +12,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QLabel, QMainWindow, QMessageBox,
+    QApplication, QFileDialog, QLabel, QMainWindow, QMessageBox, QToolBar,
 )
 
 from ..io.raster import open_raster
@@ -42,6 +43,28 @@ class MainWindow(QMainWindow):
         self.statusBar().addWidget(self._status)
 
         self._build_menu()
+        self._build_toolbar()
+
+    def _build_toolbar(self) -> None:
+        """Always-visible zoom controls, so the constantly-used +/-/reset
+        actions don't require opening the View menu. These trigger exactly the
+        same canvas methods (and therefore the same 0.05x-20x clamp and
+        anchor-under-cursor behaviour) as the View menu items — this only
+        exposes them more directly, it changes no zoom logic."""
+        bar = QToolBar("Zoom", self)
+        bar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        bar.setMovable(False)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, bar)
+
+        for text, tooltip, slot in (
+            ("−", "Zoom out", self.canvas.zoom_out),   # minus sign
+            ("Reset", "Reset view (fit to window)", self.canvas.reset_view),
+            ("+", "Zoom in", self.canvas.zoom_in),
+        ):
+            act = QAction(text, self)
+            act.setToolTip(tooltip)
+            act.triggered.connect(slot)
+            bar.addAction(act)
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
