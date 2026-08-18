@@ -33,8 +33,11 @@ import shutil
 # ---------------------------------------------------------------------------
 
 #: Bump this whenever the DDL below changes. Stored in SQLite's built-in
-#: ``PRAGMA user_version`` so an opened file can be checked against the code.
-SCHEMA_VERSION = 1
+#: ``PRAGMA user_version``. Because every change so far is purely *additive*
+#: (new tables via ``CREATE TABLE IF NOT EXISTS``), opening an older file simply
+#: re-runs the idempotent schema script and updates the version — no data
+#: migration, no breaking change. v2 added the ``source_scales`` table.
+SCHEMA_VERSION = 2
 
 DB_FILENAME = "project.db"
 SOURCES_DIRNAME = "sources"
@@ -122,6 +125,21 @@ CREATE TABLE IF NOT EXISTS points (
 
 CREATE INDEX IF NOT EXISTS idx_points_parcel ON points(parcel_id, seq);
 CREATE INDEX IF NOT EXISTS idx_fields_parcel ON parcel_fields(parcel_id, seq);
+
+-- Established real-world scale for a source file (Milestone 3). One row per
+-- source (latest calibration wins). SI-canonical: metres per rendered pixel.
+-- The two calibration points and the entered distance are kept so the scale
+-- can be redone or cross-checked, and `method` records how it was derived
+-- ('two-point' for now; metadata / reference-content methods come later).
+CREATE TABLE IF NOT EXISTS source_scales (
+    source_id        INTEGER PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+    metres_per_pixel REAL    NOT NULL,
+    method           TEXT    NOT NULL,
+    p1x REAL, p1y REAL, p2x REAL, p2y REAL,   -- calibration points (pixels)
+    real_distance_m  REAL,                     -- the entered real-world distance
+    note             TEXT,                      -- confidence / cross-check note
+    updated_at       TEXT    NOT NULL
+);
 """
 
 #: Seeded on project creation. Universally correct, region-neutral units only.
@@ -210,9 +228,14 @@ class ProjectDB:
 
     @classmethod
     def open(cls, root) -> "ProjectDB":
-        """Open an existing project folder. Validates that the schema version
-        matches this code, so an incompatible file fails loudly rather than
-        corrupting silently."""
+        """Open an existing project folder.
+
+        A file written by a *newer* code version than this one is rejected
+        loudly. A file from an *older* version is upgraded in place: because
+        every schema change is additive (new tables only), re-running the
+        idempotent schema script adds anything missing without touching
+        existing data, and the stored version is bumped to match.
+        """
         root = Path(root).resolve()
         db_path = root / DB_FILENAME
         if not db_path.exists():
@@ -220,12 +243,21 @@ class ProjectDB:
 
         conn = _connect(db_path)
         found = conn.execute("PRAGMA user_version").fetchone()[0]
-        if found != SCHEMA_VERSION:
+        if found > SCHEMA_VERSION:
             conn.close()
             raise ProjectError(
-                f"Project schema version {found} does not match supported "
-                f"version {SCHEMA_VERSION}."
+                f"Project schema version {found} is newer than this app supports "
+                f"(version {SCHEMA_VERSION}); update the application to open it."
             )
+        if found < SCHEMA_VERSION:
+            # Additive-only upgrade (e.g. v1 -> v2 adds source_scales).
+            conn.executescript(SCHEMA_SQL)
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
+            conn.commit()
         # Ensure the runtime folders exist even if the folder was hand-copied.
         (root / SOURCES_DIRNAME).mkdir(exist_ok=True)
         (root / EXPORTS_DIRNAME).mkdir(exist_ok=True)
@@ -314,6 +346,46 @@ class ProjectDB:
             "FROM sources ORDER BY id"
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # -- source scale (Milestone 3) -----------------------------------------
+
+    def set_source_scale(self, source_id: int, metres_per_pixel: float, *,
+                        method: str = "two-point",
+                        p1: tuple[float, float] | None = None,
+                        p2: tuple[float, float] | None = None,
+                        real_distance_m: float | None = None,
+                        note: str | None = None) -> None:
+        """Store (or replace) the established scale for a source, SI-canonical
+        as metres per rendered pixel. One row per source; re-calibrating simply
+        overwrites it."""
+        if metres_per_pixel <= 0:
+            raise ProjectError(f"metres_per_pixel must be positive, got {metres_per_pixel}")
+        if self.conn.execute("SELECT 1 FROM sources WHERE id = ?", (source_id,)).fetchone() is None:
+            raise ProjectError(f"No source with id {source_id} in this project.")
+        p1x, p1y = (p1 if p1 is not None else (None, None))
+        p2x, p2y = (p2 if p2 is not None else (None, None))
+        self.conn.execute(
+            "INSERT OR REPLACE INTO source_scales "
+            "(source_id, metres_per_pixel, method, p1x, p1y, p2x, p2y, real_distance_m, note, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (source_id, float(metres_per_pixel), method, p1x, p1y, p2x, p2y,
+             real_distance_m, note, _utcnow()),
+        )
+        self.conn.commit()
+
+    def get_source_scale(self, source_id: int) -> dict | None:
+        """Return the stored scale for a source as a dict, or None if unset."""
+        row = self.conn.execute(
+            "SELECT source_id, metres_per_pixel, method, p1x, p1y, p2x, p2y, "
+            "real_distance_m, note, updated_at FROM source_scales WHERE source_id = ?",
+            (source_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def clear_source_scale(self, source_id: int) -> None:
+        """Remove any stored scale for a source (used when re-calibrating)."""
+        self.conn.execute("DELETE FROM source_scales WHERE source_id = ?", (source_id,))
+        self.conn.commit()
 
     # -- unit profiles ------------------------------------------------------
 

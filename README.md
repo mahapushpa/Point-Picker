@@ -9,7 +9,7 @@ See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) for the full specification. The prior
 browser prototypes whose *logic* seeds this tool are kept under
 [reference/](reference/) for reference only.
 
-## Status — Milestones 1–2 complete
+## Status — Milestones 1–3 complete
 
 - **Milestone 1 — portable project store**: create/open a project folder
   (`project.db` + `sources/` + `exports/`); its SQLite schema works identically
@@ -18,10 +18,17 @@ browser prototypes whose *logic* seeds this tool are kept under
   a native `QGraphicsView` canvas, pan by dragging and zoom around the cursor
   with the scroll wheel. Loaders live in `src/io/` (pure Python, no Qt); the
   window and canvas are the only Qt code.
+- **Milestone 3 — manual two-point scale (SI only)**: click "Set scale", click
+  two points a known distance apart, enter the real-world distance in metres,
+  and the tool derives and displays metres-per-pixel. Redo any time. The scale
+  math is pure Python (`src/core/scale.py`); persistence lives in `project_db`
+  (per-source, SI-canonical) with round-trip tests. The GUI holds the scale in
+  memory for now — wiring the GUI to a project comes with project-aware tracing
+  (Milestone 4).
 
-Later milestones (scale calibration, polygon tracing, unit profiles,
-identification templates, summary export, DXF) are scaffolded as docstring-only
-stubs under `src/` and will be filled in one milestone at a time.
+Later milestones (polygon tracing, unit profiles, identification templates,
+summary export, DXF) are scaffolded as docstring-only stubs under `src/` and
+will be filled in one milestone at a time.
 
 ### Run commands
 
@@ -54,7 +61,8 @@ src/
   main.py            CLI: create / info / selfcheck / gui
   core/              pure Python domain logic
     project_db.py    SQLite schema + read/write for one project folder  (DONE)
-    scale.py units.py geometry.py polygon.py templates.py               (stubs)
+    scale.py         two-point scale math (metres per pixel)            (DONE)
+    units.py geometry.py polygon.py templates.py                        (stubs)
   io/                pure-Python file loaders (no Qt)
     raster.py        neutral RasterImage type + open_raster dispatcher   (DONE)
     pdf_loader.py    PDF page -> RGBA raster via PyMuPDF                  (DONE)

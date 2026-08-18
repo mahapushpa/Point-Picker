@@ -138,6 +138,91 @@ class ProjectDBTests(unittest.TestCase):
             self.assertFalse(got["is_builtin"])
             self.assertAlmostEqual(got["sq_m_per_unit"], 2529.29)
 
+    # -- scale persistence (Milestone 3) ------------------------------------
+
+    def _source_id(self, p):
+        sample = self.tmp / "sheet.png"
+        if not sample.exists():
+            sample.write_bytes(b"x")
+        return p.import_source(sample, "image")
+
+    def test_source_scale_round_trip(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            self.assertIsNone(p.get_source_scale(sid))
+            p.set_source_scale(sid, 0.0421, method="two-point",
+                               p1=(10.0, 20.0), p2=(110.0, 20.0),
+                               real_distance_m=4.21, note="grid cross-check pending")
+            got = p.get_source_scale(sid)
+            self.assertAlmostEqual(got["metres_per_pixel"], 0.0421)
+            self.assertEqual(got["method"], "two-point")
+            self.assertAlmostEqual(got["p1x"], 10.0)
+            self.assertAlmostEqual(got["p2x"], 110.0)
+            self.assertAlmostEqual(got["real_distance_m"], 4.21)
+            self.assertEqual(got["note"], "grid cross-check pending")
+            self.assertTrue(got["updated_at"])
+
+    def test_source_scale_persists_across_reopen(self):
+        root = self.tmp / "proj"
+        with ProjectDB.create(root) as p:
+            sid = self._source_id(p)
+            p.set_source_scale(sid, 0.25, p1=(0.0, 0.0), p2=(100.0, 0.0),
+                               real_distance_m=25.0)
+        with ProjectDB.open(root) as p2:
+            got = p2.get_source_scale(sid)
+            self.assertAlmostEqual(got["metres_per_pixel"], 0.25)
+
+    def test_set_source_scale_overwrites(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            p.set_source_scale(sid, 0.5)
+            p.set_source_scale(sid, 0.75)  # re-calibrate
+            self.assertAlmostEqual(p.get_source_scale(sid)["metres_per_pixel"], 0.75)
+
+    def test_clear_source_scale(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            p.set_source_scale(sid, 0.5)
+            p.clear_source_scale(sid)
+            self.assertIsNone(p.get_source_scale(sid))
+
+    def test_set_scale_rejects_nonpositive(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            with self.assertRaises(ProjectError):
+                p.set_source_scale(sid, 0.0)
+
+    def test_set_scale_rejects_unknown_source(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            with self.assertRaises(ProjectError):
+                p.set_source_scale(9999, 0.5)
+
+    def test_scale_deleted_when_source_deleted(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            p.set_source_scale(sid, 0.5)
+            p.conn.execute("DELETE FROM sources WHERE id = ?", (sid,))
+            p.conn.commit()
+            self.assertIsNone(p.get_source_scale(sid))  # ON DELETE CASCADE
+
+    def test_v1_project_upgrades_additively_on_open(self):
+        """A v1 project (no source_scales table) opens by additive upgrade to
+        the current version, gaining the new table without losing data."""
+        root = self.tmp / "legacy"
+        with ProjectDB.create(root) as p:
+            sid = self._source_id(p)
+        # Downgrade the file to look like a v1 project.
+        conn = sqlite3.connect(str(root / "project.db"))
+        conn.execute("DROP TABLE source_scales")
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+        conn.close()
+        # Opening should migrate it up and let scale be stored.
+        with ProjectDB.open(root) as p2:
+            self.assertEqual(p2.schema_version, SCHEMA_VERSION)
+            p2.set_source_scale(sid, 0.5)
+            self.assertAlmostEqual(p2.get_source_scale(sid)["metres_per_pixel"], 0.5)
+
 
 if __name__ == "__main__":
     unittest.main()
