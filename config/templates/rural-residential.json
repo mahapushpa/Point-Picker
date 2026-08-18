@@ -1,0 +1,12 @@
+{
+  "land_type": "rural-residential",
+  "display_name": "Rural - residential",
+  "description": "Starting field set for rural residential parcels. Fully user-editable per parcel; editing a parcel never changes this template.",
+  "fields": [
+    { "label": "Plot number", "value": "" },
+    { "label": "Village", "value": "" },
+    { "label": "Tehsil", "value": "" },
+    { "label": "District", "value": "" },
+    { "label": "Owner name(s)", "value": "" }
+  ]
+}

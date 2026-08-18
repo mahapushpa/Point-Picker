@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Point Picker — mark coordinates on an image</title>
+<style>
+  :root {
+    --border: #d0d0d0;
+    --accent: #1D9E75;
+    --accent-dark: #0F6E56;
+  }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 16px; background: #fafafa; color: #222; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: #666; font-size: 13px; margin-bottom: 12px; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  .toolbar > * { margin: 0; }
+  input[type=text], input[type=number] { padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; }
+  button { padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px; background: white; cursor: pointer; font-size: 13px; }
+  button:hover { background: #f0f0f0; }
+  button.primary { border-color: var(--accent-dark); color: var(--accent-dark); font-weight: 600; }
+  button.primary:hover { background: #eafaf3; }
+  #viewport {
+    position: relative; width: 100%; height: 72vh; min-height: 420px;
+    overflow: hidden; border: 1px solid var(--border); border-radius: 8px;
+    background: #eee; cursor: grab; touch-action: none;
+  }
+  #viewport.dragging { cursor: grabbing; }
+  #imgWrap { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
+  #imgWrap img { display: block; user-select: none; pointer-events: none; }
+  #marksSvg { position: absolute; top: 0; left: 0; pointer-events: none; overflow: visible; }
+  #dropHint {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: #999; font-size: 15px; text-align: center; padding: 20px;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 10px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid #eee; }
+  th { color: #777; font-weight: 600; font-size: 12px; }
+  .rmv { padding: 2px 8px; font-size: 12px; }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 10px; }
+  .col { flex: 1; min-width: 260px; }
+  .offset-box { display: flex; gap: 6px; align-items: center; font-size: 13px; color: #555; }
+  .offset-box input { width: 80px; }
+  footer { margin-top: 16px; font-size: 12px; color: #999; }
+</style>
+</head>
+<body>
+
+<h1>Point Picker</h1>
+<div class="sub">Load an image, click to mark points, export exact pixel coordinates. Everything runs locally in your browser — nothing is uploaded anywhere.</div>
+
+<div class="toolbar">
+  <input type="file" id="fileInput" accept="image/*">
+  <button id="zoomIn">Zoom in</button>
+  <button id="zoomOut">Zoom out</button>
+  <button id="resetView">Reset view</button>
+  <button id="undo">Undo last</button>
+  <span style="flex:1"></span>
+  <label class="offset-box">crop offset X <input type="number" id="offX" value="0"></label>
+  <label class="offset-box">crop offset Y <input type="number" id="offY" value="0"></label>
+</div>
+
+<div id="viewport">
+  <div id="dropHint">Choose an image file above to begin.</div>
+  <div id="imgWrap">
+    <img id="img" draggable="false">
+    <svg id="marksSvg"></svg>
+  </div>
+</div>
+
+<div class="row">
+  <div class="col">
+    <div class="toolbar">
+      <input type="text" id="labelInput" placeholder="label for next click (e.g. 12 or bend-1)" style="flex:1">
+    </div>
+    <table id="pointsTable">
+      <thead><tr><th>#</th><th>label</th><th>image px (with offset)</th><th></th></tr></thead>
+      <tbody id="pointsBody"></tbody>
+    </table>
+  </div>
+  <div class="col">
+    <div class="toolbar">
+      <button id="exportJson" class="primary">Export JSON</button>
+      <button id="exportCsv" class="primary">Export CSV</button>
+      <input type="file" id="importJson" accept="application/json" style="display:none">
+      <button id="importBtn">Import JSON</button>
+      <button id="clearAll">Clear all</button>
+    </div>
+    <p style="font-size:12px;color:#888">Tip: set the crop offset fields if this image is a crop of a larger original — exported coordinates will already include the offset, so they map directly onto the full image.</p>
+  </div>
+</div>
+
+<footer>Point Picker · single-file, no dependencies, no server. Open this .html file directly in any browser.</footer>
+
+<script>
+(function () {
+  const viewport = document.getElementById('viewport');
+  const imgWrap = document.getElementById('imgWrap');
+  const img = document.getElementById('img');
+  const svg = document.getElementById('marksSvg');
+  const dropHint = document.getElementById('dropHint');
+  const pointsBody = document.getElementById('pointsBody');
+  const labelInput = document.getElementById('labelInput');
+  const offX = document.getElementById('offX');
+  const offY = document.getElementById('offY');
+
+  let zoom = 1, panX = 0, panY = 0;
+  let dragging = false, moved = false, startX, startY;
+  let points = []; // {label, x, y}  -- x,y are RAW image pixel coords (no offset)
+  let imgLoaded = false;
+
+  function applyTransform() {
+    imgWrap.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+  }
+
+  function fitToView() {
+    const vw = viewport.clientWidth, vh = viewport.clientHeight;
+    const iw = img.naturalWidth, ih = img.naturalHeight;
+    if (!iw || !ih) return;
+    zoom = Math.min(vw / iw, vh / ih) * 0.98;
+    panX = (vw - iw * zoom) / 2;
+    panY = (vh - ih * zoom) / 2;
+    applyTransform();
+  }
+
+  document.getElementById('fileInput').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      imgLoaded = true;
+      dropHint.style.display = 'none';
+      points = [];
+      renderMarks(); renderTable();
+      fitToView();
+      URL.revokeObjectURL(url);
+    };
+    img.src = url;
+  });
+
+  viewport.addEventListener('wheel', (e) => {
+    if (!imgLoaded) return;
+    e.preventDefault();
+    const rect = viewport.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    const imgX = (mx - panX) / zoom, imgY = (my - panY) / zoom;
+    const delta = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+    zoom = Math.max(0.05, Math.min(20, zoom * delta));
+    panX = mx - imgX * zoom;
+    panY = my - imgY * zoom;
+    applyTransform();
+  }, { passive: false });
+
+  viewport.addEventListener('pointerdown', (e) => {
+    if (!imgLoaded) return;
+    dragging = true; moved = false;
+    startX = e.clientX; startY = e.clientY;
+    viewport.setPointerCapture(e.pointerId);
+    viewport.classList.add('dragging');
+  });
+
+  viewport.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - startX, dy = e.clientY - startY;
+    if (Math.abs(dx) > 4 || Math.abs(dy) > 4) moved = true;
+    if (moved) {
+      panX += e.clientX - startX; panY += e.clientY - startY;
+      startX = e.clientX; startY = e.clientY;
+      applyTransform();
+    }
+  });
+
+  viewport.addEventListener('pointerup', (e) => {
+    dragging = false;
+    viewport.classList.remove('dragging');
+    if (!imgLoaded || moved) return;
+    const rect = viewport.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    const x = Math.round(((mx - panX) / zoom) * 10) / 10;
+    const y = Math.round(((my - panY) / zoom) * 10) / 10;
+    const label = labelInput.value.trim() || `pt${points.length + 1}`;
+    points.push({ label, x, y });
+    labelInput.value = '';
+    renderMarks(); renderTable();
+  });
+
+  function renderMarks() {
+    const r = 6 / zoom, sw = 3 / zoom, fs = 15 / zoom;
+    svg.innerHTML = points.map(p => `
+      <circle cx="${p.x}" cy="${p.y}" r="${r}" fill="none" stroke="#1D9E75" stroke-width="${sw}"/>
+      <text x="${p.x + r + 4/zoom}" y="${p.y - r - 4/zoom}" font-size="${fs}" fill="#0F6E56" font-weight="600">${p.label}</text>
+    `).join('');
+  }
+
+  function renderTable() {
+    const ox = parseFloat(offX.value) || 0, oy = parseFloat(offY.value) || 0;
+    pointsBody.innerHTML = points.map((p, i) => `
+      <tr>
+        <td>${i + 1}</td>
+        <td>${p.label}</td>
+        <td>(${(p.x + ox).toFixed(1)}, ${(p.y + oy).toFixed(1)})</td>
+        <td><button class="rmv" data-i="${i}">✕</button></td>
+      </tr>
+    `).join('') || '<tr><td colspan="4" style="color:#999">No points marked yet.</td></tr>';
+    pointsBody.querySelectorAll('.rmv').forEach(b => {
+      b.onclick = () => { points.splice(+b.dataset.i, 1); renderMarks(); renderTable(); };
+    });
+  }
+
+  offX.addEventListener('input', renderTable);
+  offY.addEventListener('input', renderTable);
+
+  document.getElementById('zoomIn').onclick = () => { zoom = Math.min(20, zoom * 1.4); applyTransform(); };
+  document.getElementById('zoomOut').onclick = () => { zoom = Math.max(0.05, zoom / 1.4); applyTransform(); };
+  document.getElementById('resetView').onclick = fitToView;
+  document.getElementById('undo').onclick = () => { points.pop(); renderMarks(); renderTable(); };
+  document.getElementById('clearAll').onclick = () => { if (confirm('Clear all points?')) { points = []; renderMarks(); renderTable(); } };
+
+  document.getElementById('exportJson').onclick = () => {
+    const ox = parseFloat(offX.value) || 0, oy = parseFloat(offY.value) || 0;
+    const data = points.map(p => ({ label: p.label, x: +(p.x + ox).toFixed(1), y: +(p.y + oy).toFixed(1) }));
+    downloadFile(JSON.stringify(data, null, 2), 'points.json', 'application/json');
+  };
+
+  document.getElementById('exportCsv').onclick = () => {
+    const ox = parseFloat(offX.value) || 0, oy = parseFloat(offY.value) || 0;
+    const rows = ['label,x,y', ...points.map(p => `${p.label},${(p.x+ox).toFixed(1)},${(p.y+oy).toFixed(1)}`)];
+    downloadFile(rows.join('\n'), 'points.csv', 'text/csv');
+  };
+
+  document.getElementById('importBtn').onclick = () => document.getElementById('importJson').click();
+  document.getElementById('importJson').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        const ox = parseFloat(offX.value) || 0, oy = parseFloat(offY.value) || 0;
+        points = data.map(p => ({ label: p.label, x: p.x - ox, y: p.y - oy }));
+        renderMarks(); renderTable();
+      } catch (err) { alert('Could not parse JSON: ' + err.message); }
+    };
+    reader.readAsText(file);
+  });
+
+  function downloadFile(content, filename, mime) {
+    const blob = new Blob([content], { type: mime });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  window.addEventListener('resize', () => { if (imgLoaded) fitToView(); });
+  renderTable();
+})();
+</script>
+</body>
+</html>

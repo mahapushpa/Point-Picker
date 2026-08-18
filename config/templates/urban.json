@@ -1,0 +1,13 @@
+{
+  "land_type": "urban",
+  "display_name": "Urban",
+  "description": "Starting field set for urban parcels. Fully user-editable per parcel; editing a parcel never changes this template.",
+  "fields": [
+    { "label": "Plot / House number", "value": "" },
+    { "label": "Colony / Locality name", "value": "" },
+    { "label": "Ward", "value": "" },
+    { "label": "City", "value": "" },
+    { "label": "District", "value": "" },
+    { "label": "Owner name(s)", "value": "" }
+  ]
+}

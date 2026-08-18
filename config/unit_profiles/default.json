@@ -1,0 +1,9 @@
+{
+  "description": "Built-in, universally-correct area units seeded into every new project.db. Region-specific measures (Bigha, Biswa, ...) are NOT here - they are user-added profiles from day one, because they are not uniform across states/districts. Each factor is square metres per 1 unit.",
+  "units": [
+    { "name": "square metre", "sq_m_per_unit": 1.0 },
+    { "name": "square foot", "sq_m_per_unit": 0.09290304 },
+    { "name": "acre", "sq_m_per_unit": 4046.8564224 },
+    { "name": "hectare", "sq_m_per_unit": 10000.0 }
+  ]
+}

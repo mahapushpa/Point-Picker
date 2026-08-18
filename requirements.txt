@@ -1,0 +1,23 @@
+# Land Parcel Measurement & Revenue Records Tool - dependencies
+#
+# Milestone 1 (project folder + SQLite schema) needs NOTHING here: the database
+# is Python's stdlib `sqlite3`, and the tests use stdlib `unittest`. The
+# packages below are pulled in from Milestone 2 onward. Every one must work
+# fully offline with no license server / phone-home behaviour (dependency
+# policy in PROJECT_BRIEF.md) - verify per library before adding a new one.
+
+# --- GUI (Milestone 2+) ---
+PySide6>=6.6            # native QGraphicsView canvas for pan/zoom/click
+
+# --- File I/O (Milestone 2, 8, 9) ---
+PyMuPDF>=1.24           # PDF render to raster + physical page size + PDF export
+ezdxf>=1.1              # DXF (not DWG) reading: header units/scale, entities
+Pillow>=10.0            # image loading, DPI metadata
+opencv-python>=4.9      # image processing, grid/reference detection (M10)
+numpy>=1.26             # array math for detection/geometry helpers
+
+# --- Export (Milestone 7) ---
+reportlab>=4.0          # alternative PDF summary writer (PyMuPDF can also write)
+
+# --- Dev / test (optional) ---
+pytest>=8.0             # tests also run under stdlib `python -m unittest`
