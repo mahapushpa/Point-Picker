@@ -33,11 +33,13 @@ import shutil
 # ---------------------------------------------------------------------------
 
 #: Bump this whenever the DDL below changes. Stored in SQLite's built-in
-#: ``PRAGMA user_version``. Because every change so far is purely *additive*
-#: (new tables via ``CREATE TABLE IF NOT EXISTS``), opening an older file simply
-#: re-runs the idempotent schema script and updates the version — no data
-#: migration, no breaking change. v2 added the ``source_scales`` table.
-SCHEMA_VERSION = 2
+#: ``PRAGMA user_version``. Every change so far is purely *additive* — new
+#: tables (via ``CREATE TABLE IF NOT EXISTS``) and new columns (added with
+#: guarded ``ALTER TABLE ADD COLUMN``, see ``_ADDITIVE_COLUMNS``) — so opening
+#: an older file just applies the missing pieces and updates the version, with
+#: no data migration and no breaking change. v2 added ``source_scales``;
+#: v3 added ``parcels.closed``.
+SCHEMA_VERSION = 3
 
 DB_FILENAME = "project.db"
 SOURCES_DIRNAME = "sources"
@@ -92,6 +94,7 @@ CREATE TABLE IF NOT EXISTS parcels (
     scale_note      TEXT,                                 -- confidence / cross-check note
     unit_profile_id INTEGER REFERENCES unit_profiles(id) ON DELETE SET NULL,
     notes           TEXT,                                 -- always-present free text
+    closed          INTEGER NOT NULL DEFAULT 0,           -- 1 if the boundary is closed
     created_at      TEXT    NOT NULL,
     updated_at      TEXT    NOT NULL
 );
@@ -150,6 +153,15 @@ BUILTIN_UNIT_PROFILES = (
     ("hectare", 10000.0),
 )
 
+#: Columns added to existing tables after their first release. Applied
+#: additively via guarded ``ALTER TABLE ADD COLUMN`` (CREATE TABLE IF NOT EXISTS
+#: cannot add a column to a table that already exists). Each entry is
+#: ``(table, column, column_definition)``; the definition must carry a DEFAULT so
+#: existing rows get a value. v3 added parcels.closed.
+_ADDITIVE_COLUMNS = (
+    ("parcels", "closed", "INTEGER NOT NULL DEFAULT 0"),
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -202,6 +214,7 @@ class ProjectDB:
         conn = _connect(db_path)
         try:
             conn.executescript(SCHEMA_SQL)
+            _ensure_additive_columns(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             now = _utcnow()
             meta = {
@@ -232,9 +245,10 @@ class ProjectDB:
 
         A file written by a *newer* code version than this one is rejected
         loudly. A file from an *older* version is upgraded in place: because
-        every schema change is additive (new tables only), re-running the
-        idempotent schema script adds anything missing without touching
-        existing data, and the stored version is bumped to match.
+        every schema change is additive (new tables and new columns only),
+        re-running the idempotent schema script and adding any missing columns
+        brings the file up to date without touching existing data, and the
+        stored version is bumped to match.
         """
         root = Path(root).resolve()
         db_path = root / DB_FILENAME
@@ -250,8 +264,10 @@ class ProjectDB:
                 f"(version {SCHEMA_VERSION}); update the application to open it."
             )
         if found < SCHEMA_VERSION:
-            # Additive-only upgrade (e.g. v1 -> v2 adds source_scales).
+            # Additive-only upgrade: new tables (v2 source_scales) and new
+            # columns (v3 parcels.closed).
             conn.executescript(SCHEMA_SQL)
+            _ensure_additive_columns(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
@@ -424,7 +440,7 @@ class ProjectDB:
 
     def get_parcel_for_source(self, source_id: int) -> dict | None:
         row = self.conn.execute(
-            "SELECT id, name, source_id, scale_m_per_px, notes, created_at, updated_at "
+            "SELECT id, name, source_id, scale_m_per_px, notes, closed, created_at, updated_at "
             "FROM parcels WHERE source_id = ? ORDER BY id LIMIT 1", (source_id,)
         ).fetchone()
         return dict(row) if row else None
@@ -444,12 +460,12 @@ class ProjectDB:
         return int(cur.lastrowid)
 
     def save_polygon(self, source_id: int, pixel_points: list[tuple[float, float]],
-                    *, metres_per_pixel: float | None = None,
+                    *, closed: bool = False, metres_per_pixel: float | None = None,
                     name: str | None = None) -> int:
         """Replace the traced boundary for *source_id* with *pixel_points* (in
-        order). Returns the parcel id. Local (SI) coordinates are stored when a
-        scale is given. Passing an empty list clears the boundary but keeps the
-        parcel row."""
+        order) and record its *closed* state. Returns the parcel id. Local (SI)
+        coordinates are stored when a scale is given. Passing an empty list
+        clears the boundary but keeps the parcel row."""
         parcel_id = self.get_or_create_parcel_for_source(source_id, name=name)
         self.conn.execute("DELETE FROM points WHERE parcel_id = ?", (parcel_id,))
         for i, (px, py) in enumerate(pixel_points):
@@ -461,7 +477,10 @@ class ProjectDB:
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (parcel_id, i, str(i + 1), float(px), float(py), lx, ly),
             )
-        self.conn.execute("UPDATE parcels SET updated_at = ? WHERE id = ?", (_utcnow(), parcel_id))
+        self.conn.execute(
+            "UPDATE parcels SET updated_at = ?, closed = ? WHERE id = ?",
+            (_utcnow(), 1 if closed else 0, parcel_id),
+        )
         self.conn.commit()
         return parcel_id
 
@@ -480,12 +499,20 @@ class ProjectDB:
             return []
         return [(p["pixel_x"], p["pixel_y"]) for p in self.get_parcel_points(parcel["id"])]
 
+    def get_polygon_closed(self, source_id: int) -> bool:
+        """Return the stored closed/open state of the source's boundary. False
+        when there is no parcel yet — this is the *saved* state, not inferred
+        from the point count, so an open 3+-point boundary reloads as open."""
+        parcel = self.get_parcel_for_source(source_id)
+        return bool(parcel["closed"]) if parcel is not None else False
+
     def clear_polygon(self, source_id: int) -> None:
-        """Delete the stored boundary points for a source's parcel (if any)."""
+        """Delete the stored boundary points for a source's parcel (if any) and
+        reset its closed flag."""
         parcel = self.get_parcel_for_source(source_id)
         if parcel is not None:
             self.conn.execute("DELETE FROM points WHERE parcel_id = ?", (parcel["id"],))
-            self.conn.execute("UPDATE parcels SET updated_at = ? WHERE id = ?",
+            self.conn.execute("UPDATE parcels SET updated_at = ?, closed = 0 WHERE id = ?",
                               (_utcnow(), parcel["id"]))
             self.conn.commit()
 
@@ -534,6 +561,17 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def _ensure_additive_columns(conn: sqlite3.Connection) -> None:
+    """Add any columns in ``_ADDITIVE_COLUMNS`` that a pre-existing table is
+    missing. Idempotent: columns already present are left untouched, so this is
+    safe to run on both a freshly-created schema and an older file being
+    upgraded."""
+    for table, column, decl in _ADDITIVE_COLUMNS:
+        present = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in present:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 def _guess_file_type(path: Path) -> str:

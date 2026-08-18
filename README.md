@@ -26,9 +26,11 @@ browser prototypes whose *logic* seeds this tool are kept under
   Project registers the loaded file into the project's `sources/` (copied,
   referenced by relative path) and persists the scale and traced boundary to
   `project.db`; reopening restores them. "Trace" places a sequence of boundary
-  points forming a closed polygon (orange, distinct from the green scale
-  markers), with live segment / perimeter / area readout, plus undo / close /
-  clear. Geometry is pure Python (`src/core/geometry.py`), SI only. Tracing
+  points forming a polygon (orange, distinct from the green scale markers),
+  with live segment / perimeter / area readout, plus undo / close / clear. The
+  boundary's open/closed state is stored explicitly (`parcels.closed`) and
+  restored exactly on reload — an open 3+-point boundary reloads open, not
+  auto-closed. Geometry is pure Python (`src/core/geometry.py`), SI only. Tracing
   works **without** a scale too — the readout shows pixel units with a "(no
   scale)" indicator and switches to metres the moment a scale is set.
 

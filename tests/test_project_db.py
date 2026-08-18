@@ -300,6 +300,70 @@ class ProjectDBTests(unittest.TestCase):
             sid = self._source_id(p)
             self.assertEqual(p.get_polygon(sid), [])
 
+    # -- closed/open state persistence (v3) ---------------------------------
+
+    def test_closed_state_defaults_open(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            p.save_polygon(sid, [(0.0, 0.0), (10.0, 0.0), (5.0, 8.0)])  # closed not passed
+            self.assertFalse(p.get_polygon_closed(sid))
+
+    def test_open_boundary_with_three_points_stays_open(self):
+        root = self.tmp / "proj"
+        pts = [(0.0, 0.0), (10.0, 0.0), (5.0, 8.0)]
+        with ProjectDB.create(root) as p:
+            sid = self._source_id(p)
+            p.save_polygon(sid, pts, closed=False)   # explicitly open, 3 points
+        with ProjectDB.open(root) as p2:
+            self.assertEqual(p2.get_polygon(sid), pts)
+            self.assertFalse(p2.get_polygon_closed(sid))  # NOT auto-closed on reload
+
+    def test_closed_boundary_round_trips_closed(self):
+        root = self.tmp / "proj"
+        pts = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+        with ProjectDB.create(root) as p:
+            sid = self._source_id(p)
+            p.save_polygon(sid, pts, closed=True)
+        with ProjectDB.open(root) as p2:
+            self.assertTrue(p2.get_polygon_closed(sid))
+
+    def test_resaving_toggles_closed_state(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            pts = [(0.0, 0.0), (10.0, 0.0), (5.0, 8.0)]
+            p.save_polygon(sid, pts, closed=True)
+            self.assertTrue(p.get_polygon_closed(sid))
+            p.save_polygon(sid, pts, closed=False)  # re-open
+            self.assertFalse(p.get_polygon_closed(sid))
+
+    def test_clear_polygon_resets_closed(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            p.save_polygon(sid, [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)], closed=True)
+            p.clear_polygon(sid)
+            self.assertFalse(p.get_polygon_closed(sid))
+
+    def test_v2_project_gains_closed_column_on_open(self):
+        """A v2 project (parcels table without the `closed` column) upgrades
+        additively on open and can then store the closed state."""
+        root = self.tmp / "legacy2"
+        with ProjectDB.create(root) as p:
+            sid = self._source_id(p)
+            p.save_polygon(sid, [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)], closed=True)
+        # Downgrade to look like a v2 file: drop the column, reset the version.
+        conn = sqlite3.connect(str(root / "project.db"))
+        conn.execute("ALTER TABLE parcels DROP COLUMN closed")
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
+        conn.close()
+        # Opening migrates it: the column is re-added, prior points survive.
+        with ProjectDB.open(root) as p2:
+            self.assertEqual(p2.schema_version, SCHEMA_VERSION)
+            self.assertEqual(len(p2.get_polygon(sid)), 3)   # points preserved
+            self.assertFalse(p2.get_polygon_closed(sid))    # re-added column defaults open
+            p2.save_polygon(sid, p2.get_polygon(sid), closed=True)
+            self.assertTrue(p2.get_polygon_closed(sid))
+
 
 if __name__ == "__main__":
     unittest.main()

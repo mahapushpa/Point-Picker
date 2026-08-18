@@ -228,7 +228,9 @@ class MainWindow(QMainWindow):
 
         db_poly = self._project.get_polygon(sid)
         if db_poly:
-            self.canvas.set_polygon(db_poly, closed=len(db_poly) >= 3)  # saved boundary wins
+            # Restore the exact saved open/closed state, not one inferred from
+            # the point count — an open 3+-point boundary stays open.
+            self.canvas.set_polygon(db_poly, closed=self._project.get_polygon_closed(sid))
         elif self.canvas.polygon_points():
             self._persist_polygon()                     # push in-memory boundary
 
@@ -360,7 +362,9 @@ class MainWindow(QMainWindow):
         pts = self.canvas.polygon_points()
         mpp = self._scale.metres_per_pixel if self._scale is not None else None
         if pts:
-            self._project.save_polygon(self._source_id, pts, metres_per_pixel=mpp)
+            self._project.save_polygon(self._source_id, pts,
+                                       closed=self.canvas.is_polygon_closed(),
+                                       metres_per_pixel=mpp)
         else:
             self._project.clear_polygon(self._source_id)
 
