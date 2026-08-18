@@ -9,7 +9,7 @@ See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) for the full specification. The prior
 browser prototypes whose *logic* seeds this tool are kept under
 [reference/](reference/) for reference only.
 
-## Status — Milestones 1–7 complete
+## Status — Milestones 1–8 complete
 
 - **Milestone 1 — portable project store**: create/open a project folder
   (`project.db` + `sources/` + `exports/`); its SQLite schema works identically
@@ -73,10 +73,22 @@ browser prototypes whose *logic* seeds this tool are kept under
   opened); `MainWindow.selected_parcel_ids()` exposes it for the later consumers
   (location-fixing, report scoping). Hit-testing is pure Python in
   `src/core/selection.py`.
+- **Milestone 8 — image preprocessing (denoise + contrast)**: a **non-destructive,
+  display-time** enhancement of degraded scans, toggled from the **View** menu or
+  the **Enhance** toolbar button. Denoise is a mild median filter; contrast is
+  **CLAHE** (contrast-limited adaptive histogram equalisation on the luminance
+  channel), both with sensible defaults — no parameters to tune. It is **value-only
+  by construction**: it adjusts pixels but never resizes/crops/rotates, so the
+  pixel coordinates that scale (M3) and vertices (M6) are stored in stay valid —
+  the toggle only swaps the displayed pixmap, leaving every marker, boundary,
+  selection, and the zoom untouched, and scale/tracing/snapping behave identically
+  whichever view is shown. The dimension invariant is asserted, not assumed. The
+  processing is pure Python (Pillow + numpy) in `src/io/preprocess.py`; the raw
+  raster and the source file on disk are never modified.
 
-Later milestones (image preprocessing, unit profiles, identification templates,
-reports, DXF, location-fixing) are scaffolded or pending and will be filled in
-one milestone at a time.
+Later milestones (unit profiles, identification templates, reports, DXF,
+location-fixing) are scaffolded or pending and will be filled in one milestone
+at a time.
 
 ### Run commands
 
@@ -116,6 +128,7 @@ src/
     units.py templates.py                                               (stubs)
   io/                pure-Python file loaders (no Qt)
     raster.py        neutral RasterImage type + open_raster dispatcher   (DONE)
+    preprocess.py    denoise (median) + contrast (CLAHE), value-only     (DONE)
     pdf_loader.py    PDF page -> RGBA raster via PyMuPDF                  (DONE)
     image_loader.py  PNG/JPEG -> RGBA raster via Pillow                  (DONE)
     dxf_loader.py    DXF (Milestone 9)                                  (stub)

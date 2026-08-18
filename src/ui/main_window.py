@@ -36,6 +36,7 @@ from ..core.project_db import ProjectDB, ProjectError
 from ..core.scale import compute_two_point_scale, TwoPointScale
 from ..core.selection import parcel_at_point, parcels_in_rect
 from ..io.raster import open_raster
+from ..io.preprocess import preprocess_raster
 from .canvas_view import CanvasView
 
 #: Stable, visually-distinct colours assigned to parcels by their position, so
@@ -85,6 +86,14 @@ class MainWindow(QMainWindow):
         # opening a project / loading another file.
         self._selected_parcel_ids: set[int] = set()
 
+        # Image preprocessing (M8): a display-time, non-destructive preview. The
+        # raw raster and the source file are never modified; the enhanced raster
+        # is computed on demand and cached. Pixel coordinates are unchanged, so
+        # scale/tracing/snapping work identically whichever is shown.
+        self._raw_raster = None
+        self._pre_raster = None       # cached preprocessed raster (lazily built)
+        self._preprocess_on = False
+
         # Status bar: transient message on the left; permanent readouts right.
         self._status = QLabel("Open a PDF or image to begin.")
         self.statusBar().addWidget(self._status)
@@ -115,6 +124,13 @@ class MainWindow(QMainWindow):
             act.setToolTip(tooltip)
             act.triggered.connect(slot)
             bar.addAction(act)
+
+        bar.addSeparator()
+        self._preprocess_btn = QAction("Enhance", self)
+        self._preprocess_btn.setCheckable(True)
+        self._preprocess_btn.setToolTip("Preview denoise + contrast enhancement (non-destructive)")
+        self._preprocess_btn.toggled.connect(self.set_preprocess_enabled)
+        bar.addAction(self._preprocess_btn)
 
         bar.addSeparator()
         set_scale = QAction("Set scale", self)
@@ -223,6 +239,13 @@ class MainWindow(QMainWindow):
         self._crosshair_action.setToolTip("Full-window crosshair while picking points")
         self._crosshair_action.toggled.connect(self.canvas.set_crosshair_enabled)
         view_menu.addAction(self._crosshair_action)
+        view_menu.addSeparator()
+        self._preprocess_action = QAction("&Preprocess scan (preview)", self, checkable=True)
+        self._preprocess_action.setToolTip(
+            "Display-time denoise + contrast enhancement — non-destructive, "
+            "does not change pixel coordinates")
+        self._preprocess_action.toggled.connect(self.set_preprocess_enabled)
+        view_menu.addAction(self._preprocess_action)
 
         scale_menu = self.menuBar().addMenu("&Scale")
         set_scale_act = QAction("&Set scale (two points)…", self)
@@ -599,17 +622,58 @@ class MainWindow(QMainWindow):
             self._status.setText("Open a PDF or image to begin.")
             return
         self.canvas.set_image(raster)   # clears any prior markers/boundary
+        self._raw_raster = raster
+        self._pre_raster = None         # invalidate any cached enhancement
         self._current_path = str(path)
         self._source_id = None
         self._scale = None              # a new file has its own scale/boundaries
         self._parcels = []
         self._active_parcel_id = None
         self._selected_parcel_ids.clear()   # selection is per-source; start fresh
+        self._apply_display_image()     # honour the preprocessing toggle for the new file
         self._attach_source_to_project()
         self._update_scale_readout()
         self._update_measure_readout()
         self._status.setText(f"{Path(path).name}   —   {raster.width} × {raster.height} px")
         self._update_title()
+
+    # -- image preprocessing (Milestone 8) ----------------------------------
+
+    def set_preprocess_enabled(self, enabled: bool) -> None:
+        """Toggle the display-time denoise+contrast preview. Non-destructive: the
+        raw raster and source file are untouched, and pixel coordinates are
+        unchanged, so scale/tracing/snapping behave identically either way."""
+        enabled = bool(enabled)
+        self._preprocess_on = enabled
+        self._sync_preprocess_controls()
+        if self._raw_raster is None:
+            if enabled:
+                QMessageBox.information(self, "No document", "Open a PDF or image first.")
+                self._preprocess_on = False
+                self._sync_preprocess_controls()
+            return
+        self._apply_display_image()
+        self._status.setText(
+            "Showing enhanced scan (denoise + contrast) — display only."
+            if self._preprocess_on else "Showing original scan.")
+
+    def _apply_display_image(self) -> None:
+        """Push the raw or enhanced pixels to the canvas per the current toggle,
+        without disturbing any markers, boundary, selection, or zoom."""
+        if self._raw_raster is None:
+            return
+        if self._preprocess_on:
+            if self._pre_raster is None:
+                self._pre_raster = preprocess_raster(self._raw_raster)  # cache
+            self.canvas.set_display_pixels(self._pre_raster)
+        else:
+            self.canvas.set_display_pixels(self._raw_raster)
+
+    def _sync_preprocess_controls(self) -> None:
+        for ctrl in (self._preprocess_action, self._preprocess_btn):
+            ctrl.blockSignals(True)
+            ctrl.setChecked(self._preprocess_on)
+            ctrl.blockSignals(False)
 
     # -- scale calibration --------------------------------------------------
 

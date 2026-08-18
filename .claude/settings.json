@@ -8,7 +8,15 @@
       "Bash(./.venv/Scripts/python.exe -m unittest tests.test_main_selection -v)",
       "Bash(./.venv/Scripts/python.exe -m unittest tests.test_architecture -v)",
       "Bash(./.venv/Scripts/python.exe -c \"import subprocess\")",
-      "Bash(./.venv/Scripts/python.exe \"C:/Users/Mahabir/AppData/Local/Temp/claude/e--1-geo-Development-Software-Point-Picker/c16527aa-814d-4e00-8e77-e04f3c874e7f/scratchpad/m7_draw_smoke.py\")"
+      "Bash(./.venv/Scripts/python.exe \"C:/Users/Mahabir/AppData/Local/Temp/claude/e--1-geo-Development-Software-Point-Picker/c16527aa-814d-4e00-8e77-e04f3c874e7f/scratchpad/m7_draw_smoke.py\")",
+      "Bash(./.venv/Scripts/python.exe -c \"import importlib; [print\\(m, getattr\\(importlib.import_module\\(m\\),'__version__','?'\\)\\) for m in ['PIL','numpy','cv2','skimage'] if importlib.util.find_spec\\(m\\)]\")",
+      "Bash(./.venv/Scripts/python.exe -c ' *)",
+      "Bash(./.venv/Scripts/python.exe -m pip install \"numpy>=1.26\" -q)",
+      "Bash(./.venv/Scripts/python.exe -c \"import numpy; print\\('numpy', numpy.__version__\\)\")",
+      "Bash(./.venv/Scripts/python.exe -m unittest tests.test_preprocess -v)",
+      "Bash(./.venv/Scripts/python.exe -m unittest tests.test_main_preprocess -v)",
+      "Bash(./.venv/Scripts/python.exe -m unittest tests.test_architecture -q)",
+      "Bash(./.venv/Scripts/python.exe \"C:/Users/Mahabir/AppData/Local/Temp/claude/e--1-geo-Development-Software-Point-Picker/c16527aa-814d-4e00-8e77-e04f3c874e7f/scratchpad/m8_smoke.py\")"
     ]
   }
 }

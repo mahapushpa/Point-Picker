@@ -178,6 +178,22 @@ class CanvasView(QGraphicsView):
         self._scene.setSceneRect(QRectF(pixmap.rect()))
         self.reset_view()
 
+    def set_display_pixels(self, raster: RasterImage) -> None:
+        """Replace only the displayed pixels, keeping the scene rect, zoom/pan,
+        and every marker / boundary / selection item exactly as-is. Used for the
+        non-destructive preprocessing preview toggle: because preprocessing never
+        changes dimensions, all stored pixel coordinates stay valid, so nothing
+        else needs to move. Requires the same dimensions as the current image."""
+        if self._pixmap_item is None:
+            return
+        if (raster.width, raster.height) != (int(self._scene.sceneRect().width()),
+                                             int(self._scene.sceneRect().height())):
+            raise ValueError(
+                "set_display_pixels requires identical dimensions "
+                f"({raster.width}x{raster.height} vs scene "
+                f"{int(self._scene.sceneRect().width())}x{int(self._scene.sceneRect().height())})")
+        self._pixmap_item.setPixmap(QPixmap.fromImage(qimage_from_raster(raster)))
+
     def has_image(self) -> bool:
         return self._pixmap_item is not None
 
