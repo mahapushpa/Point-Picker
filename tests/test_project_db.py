@@ -13,10 +13,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-SRC = Path(__file__).resolve().parent.parent / "src"
-sys.path.insert(0, str(SRC))
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
-from core.project_db import (  # noqa: E402
+from src.core.project_db import (  # noqa: E402
     ProjectDB, ProjectError, SCHEMA_VERSION, BUILTIN_UNIT_PROFILES,
 )
 

@@ -1,15 +1,18 @@
 """main.py — entry point.
 
-Milestone 1 only. There is no GUI yet; this exposes a tiny command line so a
-project folder can be created, opened, inspected, and portability-checked
-without any UI framework. When the PySide6 shell arrives (Milestone 2) it will
-launch from here, but the create/open/inspect calls it makes will be exactly
-the pure-Python core.project_db calls used below.
+Entry point. Preferred invocation is ``python -m src.main`` from the repository
+root; ``python src/main.py`` also works (this module repairs sys.path so the
+``src`` package resolves either way — necessary because ``src.io`` must be
+imported qualified, as a bare top-level ``io`` is shadowed by the stdlib).
+
+Milestone 1 commands (no GUI): create / info / selfcheck.
+Milestone 2 command: gui — open a PDF/PNG/JPEG and pan/zoom it.
 
 Usage:
-    python src/main.py create <folder> [--name NAME]
-    python src/main.py info   <folder>
-    python src/main.py selfcheck [<scratch-folder>]
+    python -m src.main create <folder> [--name NAME]
+    python -m src.main info   <folder>
+    python -m src.main selfcheck [<scratch-folder>]
+    python -m src.main gui [<file>]
 """
 
 from __future__ import annotations
@@ -20,11 +23,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Allow "from core.project_db import ..." both when run as "python src/main.py"
-# (src/ is already sys.path[0]) and when imported from the repo root.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Make the `src` package importable whether launched as `python -m src.main`
+# (already fine) or `python src/main.py` (repo root not yet on the path).
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-from core.project_db import ProjectDB, ProjectError, SCHEMA_VERSION  # noqa: E402
+from src.core.project_db import ProjectDB, ProjectError, SCHEMA_VERSION  # noqa: E402
 
 
 def cmd_create(args) -> int:
@@ -115,6 +120,13 @@ def cmd_selfcheck(args) -> int:
     return 0 if ok else 1
 
 
+def cmd_gui(args) -> int:
+    """Launch the PySide6 window (Milestone 2). Imported lazily so the CLI and
+    the pure-Python tests never require PySide6 to be installed."""
+    from src.ui.main_window import run
+    return run(file=args.file)
+
+
 def _scan_for_absolute_paths(project_root: Path, original_root: Path) -> str | None:
     """Return the first stored value that looks like an absolute path from the
     original location, or None if clean. A portable DB stores none."""
@@ -157,6 +169,10 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("selfcheck", help="run the portability self-check (local-vs-copied)")
     s.add_argument("scratch", nargs="?", help="scratch folder to use (default: a temp dir)")
     s.set_defaults(func=cmd_selfcheck)
+
+    g = sub.add_parser("gui", help="open the PySide6 viewer (load + pan/zoom a PDF/image)")
+    g.add_argument("file", nargs="?", help="optional PDF/PNG/JPEG to open on startup")
+    g.set_defaults(func=cmd_gui)
 
     return ap
 
