@@ -139,6 +139,11 @@ class MainWindow(QMainWindow):
             act.setShortcut(shortcut)
             act.triggered.connect(slot)
             view_menu.addAction(act)
+        view_menu.addSeparator()
+        self._crosshair_action = QAction("Precision &crosshair", self, checkable=True)
+        self._crosshair_action.setToolTip("Full-window crosshair while picking points")
+        self._crosshair_action.toggled.connect(self.canvas.set_crosshair_enabled)
+        view_menu.addAction(self._crosshair_action)
 
         scale_menu = self.menuBar().addMenu("&Scale")
         set_scale_act = QAction("&Set scale (two points)…", self)
@@ -262,8 +267,10 @@ class MainWindow(QMainWindow):
         if not self.canvas.start_scale_calibration():
             QMessageBox.information(self, "No document", "Open a PDF or image first.")
             return
+        self._sync_crosshair_action()
         self._status.setText(
-            "Set scale: click the first point, then the second, on a known distance.")
+            "Set scale: click two points a known distance apart; drag or arrow-keys "
+            "to fine-tune, Enter to confirm, Esc to cancel.")
 
     def clear_scale(self) -> None:
         self.canvas.cancel_scale_calibration()
@@ -304,10 +311,19 @@ class MainWindow(QMainWindow):
         if not self.canvas.start_polygon():
             QMessageBox.information(self, "No document", "Open a PDF or image first.")
             return
-        hint = "Trace boundary: click to add points, then 'Close' to finish."
+        self._sync_crosshair_action()
+        hint = ("Trace boundary: click to add points; drag or arrow-keys to fine-tune; "
+                "Enter (or 'Close') to finish, Esc to cancel.")
         if self._scale is None:
             hint += "  (No scale set — measurements in pixels.)"
         self._status.setText(hint)
+
+    def _sync_crosshair_action(self) -> None:
+        """Reflect the canvas's current crosshair state (on for scale, off for
+        polygon by default) in the checkable menu item, without re-triggering it."""
+        self._crosshair_action.blockSignals(True)
+        self._crosshair_action.setChecked(self.canvas.is_crosshair_enabled())
+        self._crosshair_action.blockSignals(False)
 
     def close_polygon(self) -> None:
         if not self.canvas.close_polygon():

@@ -32,6 +32,14 @@ browser prototypes whose *logic* seeds this tool are kept under
   works **without** a scale too — the readout shows pixel units with a "(no
   scale)" indicator and switches to metres the moment a scale is set.
 
+- **Point-placement refinements (shared by scale + tracing)**: both picks follow
+  **place → adjust → confirm**. After placing a point you can drag it, or select
+  it and nudge with the arrow keys (1 px, or 10 px with Shift), before
+  finalising. **Enter** confirms (scale → distance prompt; polygon → close);
+  **Esc** fully cancels an in-progress pick with no residual points. A toggleable
+  full-window precision crosshair (dark core + light halo, CAD/GIS style) is on
+  by default while calibrating scale, off by default while tracing.
+
 Later milestones (unit profiles, identification templates, summary export, DXF)
 are scaffolded as docstring-only stubs under `src/` and will be filled in one
 milestone at a time.
