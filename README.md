@@ -9,7 +9,7 @@ See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) for the full specification. The prior
 browser prototypes whose *logic* seeds this tool are kept under
 [reference/](reference/) for reference only.
 
-## Status — Milestones 1–4 complete
+## Status — Milestones 1–7 complete
 
 - **Milestone 1 — portable project store**: create/open a project folder
   (`project.db` + `sources/` + `exports/`); its SQLite schema works identically
@@ -59,10 +59,24 @@ browser prototypes whose *logic* seeds this tool are kept under
   it, so a shared edge is structurally identical, not just visually close. The
   snap rule lives in `src/core/polygon.py` and is used by both the canvas and the
   DB.
+- **Milestone 7 — parcel selection (multi-select)**: a **working subset** of
+  parcels, kept strictly separate from the single active/editable parcel. In the
+  new **Select** canvas mode, click a parcel (its fill or boundary) to toggle it,
+  or drag a **marquee** to catch every parcel touching or within it (additive).
+  Three on-canvas states are now visually distinct: active-for-editing (thick
+  outline + vertex dots), selected-but-not-active (translucent fill + heavier
+  outline), and unselected context (thin muted outline). The **Parcels** sidebar
+  shows both at once — the current row is the active parcel, a per-row checkbox is
+  selection membership — with **Select all** / **Clear selection** actions and a
+  live "*N* parcels selected" count. Selection is **session-only** (a scratch
+  working set — not written to the DB, cleared when another file or project is
+  opened); `MainWindow.selected_parcel_ids()` exposes it for the later consumers
+  (location-fixing, report scoping). Hit-testing is pure Python in
+  `src/core/selection.py`.
 
-Later milestones (parcel multi-select, image preprocessing, unit profiles,
-identification templates, reports, DXF, location-fixing) are scaffolded or
-pending and will be filled in one milestone at a time.
+Later milestones (image preprocessing, unit profiles, identification templates,
+reports, DXF, location-fixing) are scaffolded or pending and will be filled in
+one milestone at a time.
 
 ### Run commands
 
@@ -98,6 +112,7 @@ src/
     scale.py         two-point scale math (metres per pixel)            (DONE)
     geometry.py      segment / perimeter / shoelace-area (SI)           (DONE)
     polygon.py       shared-vertex snap rule + tolerance                (DONE)
+    selection.py     parcel hit-testing (click + marquee) for M7        (DONE)
     units.py templates.py                                               (stubs)
   io/                pure-Python file loaders (no Qt)
     raster.py        neutral RasterImage type + open_raster dispatcher   (DONE)

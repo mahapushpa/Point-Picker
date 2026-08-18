@@ -30,9 +30,10 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QBrush
+from PySide6.QtGui import QPolygonF
 from PySide6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsEllipseItem, QGraphicsLineItem,
-    QGraphicsSimpleTextItem, QGraphicsItem,
+    QGraphicsSimpleTextItem, QGraphicsPolygonItem, QGraphicsRectItem, QGraphicsItem,
 )
 
 from ..core.polygon import nearest_vertex_index, SNAP_TOLERANCE_PX
@@ -42,6 +43,8 @@ _MARK_COLOR = QColor("#1D9E75")  # scale-calibration markers: accent green (as p
 _POLY_COLOR = QColor("#E8770F")  # boundary-tracing markers: orange, visually distinct
 _ACTIVE_HALO = QColor("#FFFFFF")  # ring around the currently-selected point
 _SNAP_COLOR = QColor("#D6336C")   # snap indicator: magenta, "about to reuse this vertex"
+_MARQUEE_COLOR = QColor("#0B7285")  # rubber-band selection rectangle
+_SELECTED_FILL_ALPHA = 70         # translucent fill marking a selected (not active) parcel
 
 
 def qimage_from_raster(raster: RasterImage) -> QImage:
@@ -81,6 +84,12 @@ class CanvasView(QGraphicsView):
     #: Emitted (vertex_id, x, y) when an existing shared vertex is moved, so the
     #: move is applied to every parcel referencing it rather than forking it.
     vertexMoved = Signal(int, float, float)
+    #: Emitted (scene x, y) when the user clicks in selection mode without
+    #: dragging — the window hit-tests it against parcels to toggle one.
+    selectionClicked = Signal(QPointF)
+    #: Emitted (min_x, min_y, max_x, max_y in scene coords) when a marquee drag
+    #: finishes in selection mode.
+    marqueeSelected = Signal(float, float, float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -120,6 +129,17 @@ class CanvasView(QGraphicsView):
         self._snap_indicator: QGraphicsItem | None = None
         self._snap_hover_id: int | None = None
 
+        # Parcel selection (Milestone 7) — a working subset, distinct from the
+        # single active/editable parcel. Session state; ids drive how background
+        # parcels are drawn (translucent fill) but never which one is editable.
+        self._selecting = False
+        self._selected_ids: set[int] = set()
+        self._sel_dragging = False
+        self._sel_moved = False
+        self._sel_press_vp = None            # QPointF viewport pos at press
+        self._sel_origin_scene: QPointF | None = None
+        self._marquee_item: QGraphicsItem | None = None
+
         # Precision crosshair.
         self._crosshair_enabled = False
         self._cursor_vp_pos = None  # QPoint in viewport coords, or None
@@ -148,6 +168,10 @@ class CanvasView(QGraphicsView):
         self._snap_vertices.clear()
         self._snap_indicator = None
         self._snap_hover_id = None
+        self._selecting = False
+        self._selected_ids.clear()
+        self._sel_dragging = False
+        self._marquee_item = None
         self._active = None
         self._drag_kind = self._drag_index = None
         self._pixmap_item = self._scene.addPixmap(pixmap)
@@ -180,6 +204,7 @@ class CanvasView(QGraphicsView):
         if self._pixmap_item is None:
             return False
         self._reset_polygon_mode()          # modes are mutually exclusive
+        self._reset_selection_mode()
         self.clear_scale_markers()
         self._calibrating = True
         self._crosshair_enabled = True       # crosshair on by default for scale
@@ -212,6 +237,7 @@ class CanvasView(QGraphicsView):
         if self._pixmap_item is None:
             return False
         self._reset_calibration_mode()       # modes are mutually exclusive
+        self._reset_selection_mode()
         if self._poly_closed:
             self._poly_closed = False        # re-open to continue editing
         self._tracing = True
@@ -314,13 +340,15 @@ class CanvasView(QGraphicsView):
 
     def set_background_polygons(self, polygons) -> None:
         """Draw other parcels of the same source for context, non-interactively.
-        *polygons* is a list of ``(points, vertex_ids, closed, color, label)``
-        where points are (x, y) image-pixel tuples. Vertex ids let a shared
-        vertex move in lock-step when edited via the active parcel. Visuals only —
-        hit-testing and editing always target the single active boundary."""
+        *polygons* is a list of ``(parcel_id, points, vertex_ids, closed, color,
+        label)`` where points are (x, y) image-pixel tuples. ``parcel_id`` lets a
+        selected background parcel draw in its distinct selected state; vertex ids
+        let a shared vertex move in lock-step when edited via the active parcel.
+        Visuals only — hit-testing and editing always target the active boundary."""
         self._bg_polys = []
-        for points, vertex_ids, closed, color, label in polygons:
+        for parcel_id, points, vertex_ids, closed, color, label in polygons:
             self._bg_polys.append({
+                "parcel_id": None if parcel_id is None else int(parcel_id),
                 "points": [QPointF(float(x), float(y)) for x, y in points],
                 "vertex_ids": [None if v is None else int(v) for v in (vertex_ids or [])],
                 "closed": bool(closed),
@@ -329,16 +357,39 @@ class CanvasView(QGraphicsView):
             })
         self._redraw_backgrounds()
 
+    def set_selected_ids(self, ids) -> None:
+        """Record which parcels are in the current selection (a working subset,
+        separate from the active parcel) so background parcels can render their
+        selected state. Purely visual; does not change the active parcel."""
+        self._selected_ids = {int(i) for i in ids}
+        self._redraw_backgrounds()
+
+    def selected_ids(self) -> set[int]:
+        return set(self._selected_ids)
+
     def _redraw_backgrounds(self) -> None:
         self._remove_items(self._bg_items)
         for poly in self._bg_polys:
             qpts = poly["points"]
             if not qpts:
                 continue
+            selected = poly["parcel_id"] is not None and poly["parcel_id"] in self._selected_ids
+            if selected and len(qpts) >= 3:
+                # Selected-but-not-active: a translucent fill (unique to this
+                # state — the active parcel has vertex dots, unselected ones are
+                # a bare outline), plus a solid outline in the parcel colour.
+                fill = QColor(poly["color"])
+                fill.setAlpha(_SELECTED_FILL_ALPHA)
+                shape = QGraphicsPolygonItem(QPolygonF(qpts))
+                shape.setBrush(QBrush(fill))
+                shape.setPen(QPen(Qt.PenStyle.NoPen))
+                shape.setZValue(0.5)  # above the pixmap, below the outlines
+                self._scene.addItem(shape)
+                self._bg_items.append(shape)
             qcolor = QColor(poly["color"])
-            qcolor.setAlpha(210)  # slightly muted so the active boundary stands out
+            qcolor.setAlpha(255 if selected else 210)  # muted unless selected
             pen = QPen(qcolor)
-            pen.setWidth(2)
+            pen.setWidth(3 if selected else 2)          # selected reads heavier
             pen.setCosmetic(True)
             segments = list(zip(qpts, qpts[1:]))
             if poly["closed"] and len(qpts) >= 3:
@@ -405,6 +456,60 @@ class CanvasView(QGraphicsView):
     def is_picking(self) -> bool:
         return self._calibrating or self._tracing
 
+    # -- parcel selection (Milestone 7) -------------------------------------
+
+    def start_selection(self) -> bool:
+        """Enter selection mode: click a parcel to toggle it, or drag a marquee to
+        catch several. Leaves any traced boundary intact (a view operation, like
+        scale). Returns False if there is no image."""
+        if self._pixmap_item is None:
+            return False
+        self._reset_calibration_mode()   # drop an in-progress calibration
+        self._reset_polygon_mode()       # stop tracing, keep the polygon
+        self._clear_snap_indicator()
+        self._selecting = True
+        self.setFocus()
+        self._update_cursor()
+        self.viewport().update()
+        return True
+
+    def stop_selection(self) -> None:
+        self._selecting = False
+        self._clear_marquee()
+        self._update_cursor()
+        self.viewport().update()
+
+    def is_selecting(self) -> bool:
+        return self._selecting
+
+    def _reset_selection_mode(self) -> None:
+        """Leave selection interaction without discarding the selection itself —
+        selected parcels stay highlighted while another tool is used."""
+        self._selecting = False
+        self._sel_dragging = False
+        self._clear_marquee()
+
+    def _update_marquee(self, rect: QRectF) -> None:
+        if self._marquee_item is None:
+            pen = QPen(_MARQUEE_COLOR)
+            pen.setWidth(1)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            fill = QColor(_MARQUEE_COLOR)
+            fill.setAlpha(40)
+            item = QGraphicsRectItem()
+            item.setPen(pen)
+            item.setBrush(QBrush(fill))
+            item.setZValue(30)
+            self._scene.addItem(item)
+            self._marquee_item = item
+        self._marquee_item.setRect(rect)
+
+    def _clear_marquee(self) -> None:
+        if self._marquee_item is not None and self._marquee_item.scene() is self._scene:
+            self._scene.removeItem(self._marquee_item)
+        self._marquee_item = None
+
     # -- zoom ---------------------------------------------------------------
 
     def wheelEvent(self, event) -> None:
@@ -434,6 +539,17 @@ class CanvasView(QGraphicsView):
     # -- mouse --------------------------------------------------------------
 
     def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._pixmap_item is not None \
+                and self._selecting:
+            # Selection mode: left-drag draws a marquee, a plain click toggles a
+            # parcel. Both resolve on release.
+            pos = event.position()
+            self._sel_dragging = True
+            self._sel_moved = False
+            self._sel_press_vp = pos
+            self._sel_origin_scene = self.mapToScene(pos.toPoint())
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._pixmap_item is not None:
             pos = event.position()
             hit = self._marker_at(pos) if self.is_picking() else None
@@ -458,6 +574,17 @@ class CanvasView(QGraphicsView):
         self._cursor_vp_pos = pos.toPoint()
         if self._crosshair_enabled and self.is_picking():
             self.viewport().update()
+
+        if self._selecting and self._sel_dragging:
+            if not self._sel_moved and \
+                    (pos - self._sel_press_vp).manhattanLength() > self.CLICK_MOVE_THRESHOLD:
+                self._sel_moved = True
+            if self._sel_moved:
+                rect = QRectF(self._sel_origin_scene,
+                              self.mapToScene(pos.toPoint())).normalized()
+                self._update_marquee(rect)
+            event.accept()
+            return
 
         if self._drag_index is not None:
             self._set_marker_position(self._drag_kind, self._drag_index,
@@ -485,6 +612,18 @@ class CanvasView(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._selecting and self._sel_dragging:
+            self._sel_dragging = False
+            if self._sel_moved and self._sel_origin_scene is not None:
+                rect = QRectF(self._sel_origin_scene,
+                              self.mapToScene(event.position().toPoint())).normalized()
+                self._clear_marquee()
+                self.marqueeSelected.emit(rect.left(), rect.top(), rect.right(), rect.bottom())
+            elif self._sel_origin_scene is not None:
+                self.selectionClicked.emit(self._sel_origin_scene)
+            self._sel_origin_scene = None
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             if self._drag_index is not None:
                 # Finished fine-tuning a point; persist the final position.
@@ -815,5 +954,7 @@ class CanvasView(QGraphicsView):
             # Hide the OS cursor when the drawn crosshair is showing, else a cross.
             self.setCursor(Qt.CursorShape.BlankCursor if self._crosshair_enabled
                            else Qt.CursorShape.CrossCursor)
+        elif self._selecting:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
         else:
             self.setCursor(Qt.CursorShape.OpenHandCursor)

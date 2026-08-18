@@ -207,7 +207,7 @@ class CanvasPointEditingTests(unittest.TestCase):
         c.set_polygon([(100.0, 0.0), (200.0, 0.0), (150.0, 90.0)],
                       closed=True, vertex_ids=[7, 8, 9])
         c.set_background_polygons([
-            ([(100.0, 0.0), (0.0, 0.0), (0.0, 100.0)], [7, 10, 11], True, "#2D7DD2", "2"),
+            (2, [(100.0, 0.0), (0.0, 0.0), (0.0, 100.0)], [7, 10, 11], True, "#2D7DD2", "2"),
         ])
         c._set_marker_position("poly", 0, QPointF(100.0, -40.0))  # move the shared vertex
         self.assertEqual(moved, [(7, 100.0, -40.0)])              # emitted, not polygonChanged
@@ -225,6 +225,36 @@ class CanvasPointEditingTests(unittest.TestCase):
         changed.clear()
         c._set_marker_position("poly", 0, QPointF(20.0, 20.0))
         self.assertEqual(changed, [True])         # structural change, not a shared move
+
+    # -- selection mode (Milestone 7) ---------------------------------------
+
+    def test_selection_mode_requires_image(self):
+        c = CanvasView()                          # no image set
+        self.assertFalse(c.start_selection())
+        self.assertFalse(c.is_selecting())
+
+    def test_start_selection_enters_mode_without_disturbing_polygon(self):
+        c = self._canvas()
+        c.start_polygon()
+        for p in [(1, 1), (2, 2), (3, 1)]:
+            c._place_point(QPointF(*p))
+        self.assertTrue(c.start_selection())
+        self.assertTrue(c.is_selecting())
+        self.assertFalse(c.is_tracing())          # tracing stops...
+        self.assertEqual(len(c.polygon_points()), 3)   # ...but the boundary survives
+
+    def test_selected_ids_roundtrip(self):
+        c = self._canvas()
+        c.set_selected_ids([3, 5])
+        self.assertEqual(c.selected_ids(), {3, 5})
+
+    def test_entering_another_mode_keeps_selection_but_exits_selecting(self):
+        c = self._canvas()
+        c.set_selected_ids([2, 4])
+        c.start_selection()
+        c.start_polygon()                          # switch tools
+        self.assertFalse(c.is_selecting())         # no longer interacting...
+        self.assertEqual(c.selected_ids(), {2, 4})  # ...but the selection persists
 
 
 if __name__ == "__main__":

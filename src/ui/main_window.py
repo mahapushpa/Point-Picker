@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 from ..core.geometry import measure_polygon
 from ..core.project_db import ProjectDB, ProjectError
 from ..core.scale import compute_two_point_scale, TwoPointScale
+from ..core.selection import parcel_at_point, parcels_in_rect
 from ..io.raster import open_raster
 from .canvas_view import CanvasView
 
@@ -69,6 +70,8 @@ class MainWindow(QMainWindow):
         self.canvas.polygonChanged.connect(self._on_polygon_changed)
         self.canvas.polygonClosed.connect(self._on_polygon_closed)
         self.canvas.vertexMoved.connect(self._on_vertex_moved)
+        self.canvas.selectionClicked.connect(self._on_selection_clicked)
+        self.canvas.marqueeSelected.connect(self._on_marquee_selected)
 
         # Session state.
         self._project: ProjectDB | None = None
@@ -77,6 +80,10 @@ class MainWindow(QMainWindow):
         self._scale: TwoPointScale | None = None  # in-memory; mirrors the DB when a project is open
         self._parcels: list[dict] = []            # parcels of the current source (project mode)
         self._active_parcel_id: int | None = None
+        # A working subset of parcels, separate from the single active parcel.
+        # Session-only (a scratch working set): never persisted, cleared on
+        # opening a project / loading another file.
+        self._selected_parcel_ids: set[int] = set()
 
         # Status bar: transient message on the left; permanent readouts right.
         self._status = QLabel("Open a PDF or image to begin.")
@@ -127,6 +134,12 @@ class MainWindow(QMainWindow):
             act.triggered.connect(slot)
             bar.addAction(act)
 
+        bar.addSeparator()
+        select_act = QAction("Select", self)
+        select_act.setToolTip("Select parcels: click a parcel to toggle it, drag a marquee for several")
+        select_act.triggered.connect(self.begin_selection)
+        bar.addAction(select_act)
+
     def _build_parcel_dock(self) -> None:
         """Sidebar listing the current source's parcels: select the active one,
         add/delete, and edit its owner. Only meaningful with a project open."""
@@ -138,7 +151,10 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(6, 6, 6, 6)
 
         self._parcel_list = QListWidget()
+        # Current row = the active (editable) parcel; the checkbox = membership of
+        # the selection working set. Two independent states in one list.
         self._parcel_list.currentRowChanged.connect(self._on_parcel_row_changed)
+        self._parcel_list.itemChanged.connect(self._on_parcel_item_changed)
         layout.addWidget(self._parcel_list, 1)
 
         buttons = QHBoxLayout()
@@ -149,6 +165,18 @@ class MainWindow(QMainWindow):
         buttons.addWidget(self._new_parcel_btn)
         buttons.addWidget(self._del_parcel_btn)
         layout.addLayout(buttons)
+
+        # Selection working-set controls (Milestone 7).
+        sel_buttons = QHBoxLayout()
+        self._select_all_btn = QPushButton("Select all")
+        self._select_all_btn.clicked.connect(self.select_all_parcels)
+        self._clear_sel_btn = QPushButton("Clear selection")
+        self._clear_sel_btn.clicked.connect(self.clear_selection)
+        sel_buttons.addWidget(self._select_all_btn)
+        sel_buttons.addWidget(self._clear_sel_btn)
+        layout.addLayout(sel_buttons)
+        self._selection_label = QLabel("No parcels selected")
+        layout.addWidget(self._selection_label)
 
         layout.addWidget(QLabel("Owner:"))
         self._owner_edit = QLineEdit()
@@ -204,6 +232,18 @@ class MainWindow(QMainWindow):
         clear_scale_act.triggered.connect(self.clear_scale)
         scale_menu.addAction(clear_scale_act)
 
+        select_menu = self.menuBar().addMenu("Se&lection")
+        select_act = QAction("&Select parcels (click / marquee)", self)
+        select_act.triggered.connect(self.begin_selection)
+        select_menu.addAction(select_act)
+        select_menu.addSeparator()
+        select_all_act = QAction("Select &all parcels", self)
+        select_all_act.triggered.connect(self.select_all_parcels)
+        select_menu.addAction(select_all_act)
+        clear_sel_act = QAction("&Clear selection", self)
+        clear_sel_act.triggered.connect(self.clear_selection)
+        select_menu.addAction(clear_sel_act)
+
         poly_menu = self.menuBar().addMenu("&Boundary")
         trace_act = QAction("&Trace boundary", self)
         trace_act.triggered.connect(self.begin_polygon_tracing)
@@ -257,6 +297,7 @@ class MainWindow(QMainWindow):
         self._source_id = None
         self._parcels = []
         self._active_parcel_id = None
+        self._selected_parcel_ids.clear()   # selection is a per-session working set
         self._project_readout.setText(f"Project: {proj.get_meta('project_name')}")
         self._update_title()
 
@@ -313,6 +354,7 @@ class MainWindow(QMainWindow):
         if select_id not in ids:
             select_id = ids[0] if ids else None
         self._set_active_parcel(select_id)
+        self._update_selection_ui()   # prune stale ids, sync checkboxes + count
         self._refresh_parcel_controls_enabled()
 
     def _rebuild_parcel_list(self) -> None:
@@ -322,6 +364,9 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(self._parcel_label(i, p))
             item.setForeground(_parcel_color(i))  # colour matches the on-canvas boundary
             item.setData(Qt.ItemDataRole.UserRole, p["id"])
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if p["id"] in self._selected_parcel_ids
+                               else Qt.CheckState.Unchecked)
             self._parcel_list.addItem(item)
         self._parcel_list.blockSignals(False)
 
@@ -373,8 +418,9 @@ class MainWindow(QMainWindow):
                 continue
             pts = self._project.get_parcel_polygon(p["id"])
             vids = self._project.get_parcel_vertex_ids(p["id"])
-            polys.append((pts, vids, bool(p["closed"]), _parcel_color(i), f"{i + 1}"))
+            polys.append((p["id"], pts, vids, bool(p["closed"]), _parcel_color(i), f"{i + 1}"))
         self.canvas.set_background_polygons(polys)
+        self.canvas.set_selected_ids(self._selected_parcel_ids)
 
     def _refresh_snap_vertices(self) -> None:
         """Give the canvas the source's vertices so new points snap onto shared
@@ -425,9 +471,102 @@ class MainWindow(QMainWindow):
 
     def _refresh_parcel_controls_enabled(self) -> None:
         has_project = self._project is not None and self._source_id is not None
+        has_parcels = has_project and bool(self._parcels)
         self._new_parcel_btn.setEnabled(has_project)
         self._del_parcel_btn.setEnabled(has_project and self._active_parcel_id is not None)
         self._owner_edit.setEnabled(has_project and self._active_parcel_id is not None)
+        self._select_all_btn.setEnabled(has_parcels)
+        self._clear_sel_btn.setEnabled(has_parcels and bool(self._selected_parcel_ids))
+
+    # -- parcel selection (Milestone 7) -------------------------------------
+
+    def begin_selection(self) -> None:
+        """Enter canvas selection mode: click a parcel to toggle it, drag a marquee
+        to catch several. Distinct from the active (editable) parcel."""
+        if not self.canvas.start_selection():
+            QMessageBox.information(self, "No document", "Open a PDF or image first.")
+            return
+        self._sync_crosshair_action()
+        self._status.setText(
+            "Select parcels: click a parcel to toggle it; drag a marquee to select "
+            "several. This working subset is separate from the active parcel.")
+
+    def selected_parcel_ids(self) -> list[int]:
+        """The current selection working subset, in parcel (display) order. This
+        is the hook later milestones (location-fixing, report scoping) consume."""
+        return [p["id"] for p in self._parcels if p["id"] in self._selected_parcel_ids]
+
+    def set_parcel_selected(self, parcel_id: int, selected: bool) -> None:
+        if selected:
+            self._selected_parcel_ids.add(parcel_id)
+        else:
+            self._selected_parcel_ids.discard(parcel_id)
+        self._update_selection_ui()
+
+    def toggle_parcel_selection(self, parcel_id: int) -> None:
+        self.set_parcel_selected(parcel_id, parcel_id not in self._selected_parcel_ids)
+
+    def select_all_parcels(self) -> None:
+        self._selected_parcel_ids = {p["id"] for p in self._parcels}
+        self._update_selection_ui()
+
+    def clear_selection(self) -> None:
+        self._selected_parcel_ids.clear()
+        self._update_selection_ui()
+
+    def _on_selection_clicked(self, scene_pt) -> None:
+        """A click in selection mode: toggle the parcel under the cursor (if any)."""
+        parcels = [(p["id"], self._project.get_parcel_polygon(p["id"])) for p in self._parcels] \
+            if self._project is not None else []
+        pid = parcel_at_point(parcels, (scene_pt.x(), scene_pt.y()))
+        if pid is not None:
+            self.toggle_parcel_selection(pid)
+
+    def _on_marquee_selected(self, x0: float, y0: float, x1: float, y1: float) -> None:
+        """A marquee drag in selection mode: add every parcel it touches to the
+        selection (additive; click-toggle removes individual ones)."""
+        if self._project is None:
+            return
+        parcels = [(p["id"], self._project.get_parcel_polygon(p["id"])) for p in self._parcels]
+        hit = parcels_in_rect(parcels, (x0, y0, x1, y1))
+        if hit:
+            self._selected_parcel_ids.update(hit)
+            self._update_selection_ui()
+
+    def _on_parcel_item_changed(self, item) -> None:
+        """Sidebar checkbox toggled: mirror it into the selection set (independent
+        of which parcel is active)."""
+        pid = item.data(Qt.ItemDataRole.UserRole)
+        if pid is None:
+            return
+        selected = item.checkState() == Qt.CheckState.Checked
+        if selected == (pid in self._selected_parcel_ids):
+            return  # no real change (e.g. programmatic refresh)
+        self.set_parcel_selected(pid, selected)
+
+    def _update_selection_ui(self) -> None:
+        """Reflect the selection set everywhere: the count label, the sidebar
+        checkboxes, and the canvas highlight — without touching the active parcel."""
+        # Drop ids that no longer exist (e.g. after a delete).
+        live = {p["id"] for p in self._parcels}
+        self._selected_parcel_ids &= live
+
+        n = len(self._selected_parcel_ids)
+        self._selection_label.setText(
+            "No parcels selected" if n == 0
+            else f"{n} parcel{'s' if n != 1 else ''} selected")
+
+        self._parcel_list.blockSignals(True)
+        for row in range(self._parcel_list.count()):
+            it = self._parcel_list.item(row)
+            pid = it.data(Qt.ItemDataRole.UserRole)
+            want = Qt.CheckState.Checked if pid in self._selected_parcel_ids else Qt.CheckState.Unchecked
+            if it.checkState() != want:
+                it.setCheckState(want)
+        self._parcel_list.blockSignals(False)
+
+        self.canvas.set_selected_ids(self._selected_parcel_ids)
+        self._clear_sel_btn.setEnabled(bool(self._selected_parcel_ids))
 
     def _parcel_index(self, parcel_id: int | None) -> int | None:
         for i, p in enumerate(self._parcels):
@@ -465,6 +604,7 @@ class MainWindow(QMainWindow):
         self._scale = None              # a new file has its own scale/boundaries
         self._parcels = []
         self._active_parcel_id = None
+        self._selected_parcel_ids.clear()   # selection is per-source; start fresh
         self._attach_source_to_project()
         self._update_scale_readout()
         self._update_measure_readout()
