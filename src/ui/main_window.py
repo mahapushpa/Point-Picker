@@ -68,6 +68,7 @@ class MainWindow(QMainWindow):
         self.canvas.twoPointsPicked.connect(self._on_two_points_picked)
         self.canvas.polygonChanged.connect(self._on_polygon_changed)
         self.canvas.polygonClosed.connect(self._on_polygon_closed)
+        self.canvas.vertexMoved.connect(self._on_vertex_moved)
 
         # Session state.
         self._project: ProjectDB | None = None
@@ -335,6 +336,7 @@ class MainWindow(QMainWindow):
         if parcel_id is None:
             self.canvas.set_polygon([], closed=False)
             self.canvas.set_background_polygons([])
+            self._refresh_snap_vertices()
             self._owner_edit.blockSignals(True)
             self._owner_edit.setText("")
             self._owner_edit.blockSignals(False)
@@ -344,7 +346,10 @@ class MainWindow(QMainWindow):
         index = self._parcel_index(parcel_id)
         self.canvas.set_active_color(_parcel_color(index if index is not None else 0))
         pts = self._project.get_parcel_polygon(parcel_id)
-        self.canvas.set_polygon(pts, closed=self._project.get_parcel_closed(parcel_id))
+        vids = self._project.get_parcel_vertex_ids(parcel_id)
+        self.canvas.set_polygon(pts, closed=self._project.get_parcel_closed(parcel_id),
+                                vertex_ids=vids)
+        self._refresh_snap_vertices()
         self._refresh_backgrounds()
 
         parcel = self._parcels[index] if index is not None else self._project.get_parcel(parcel_id)
@@ -360,14 +365,25 @@ class MainWindow(QMainWindow):
         self._update_measure_readout()
 
     def _refresh_backgrounds(self) -> None:
-        """Draw every parcel except the active one as a context overlay."""
+        """Draw every parcel except the active one as a context overlay, carrying
+        vertex ids so a shared vertex moves in lock-step when edited."""
         polys = []
         for i, p in enumerate(self._parcels):
             if p["id"] == self._active_parcel_id:
                 continue
             pts = self._project.get_parcel_polygon(p["id"])
-            polys.append((pts, bool(p["closed"]), _parcel_color(i), f"{i + 1}"))
+            vids = self._project.get_parcel_vertex_ids(p["id"])
+            polys.append((pts, vids, bool(p["closed"]), _parcel_color(i), f"{i + 1}"))
         self.canvas.set_background_polygons(polys)
+
+    def _refresh_snap_vertices(self) -> None:
+        """Give the canvas the source's vertices so new points snap onto shared
+        ones (the canvas excludes the active parcel's own vertices)."""
+        if self._project is None or self._source_id is None:
+            self.canvas.set_snap_vertices([])
+            return
+        self.canvas.set_snap_vertices(
+            [(v["id"], v["pixel_x"], v["pixel_y"]) for v in self._project.list_vertices(self._source_id)])
 
     def new_parcel(self) -> None:
         if self._project is None or self._source_id is None:
@@ -471,7 +487,7 @@ class MainWindow(QMainWindow):
         self._scale = None
         if self._project is not None and self._source_id is not None:
             self._project.clear_source_scale(self._source_id)
-            self._refresh_all_parcels_si()  # parcels' local coords no longer have a scale
+            self._project.refresh_source_vertices_si(self._source_id, None)  # drop SI coords
         self._update_scale_readout()
         self._update_measure_readout()
         self._status.setText("Scale cleared.")
@@ -546,18 +562,9 @@ class MainWindow(QMainWindow):
             self._source_id, s.metres_per_pixel, method=s.method,
             p1=s.p1, p2=s.p2, real_distance_m=s.real_distance_m,
         )
-        self._refresh_all_parcels_si()  # every parcel's SI coords use the source scale
-
-    def _refresh_all_parcels_si(self) -> None:
-        """Re-store every parcel's boundary so its SI (local_x/local_y) columns
-        reflect the current source scale. Points are unchanged."""
-        if self._project is None or self._source_id is None:
-            return
-        mpp = self._mpp()
-        for p in self._project.list_parcels(self._source_id):
-            pts = self._project.get_parcel_polygon(p["id"])
-            self._project.save_parcel_polygon(p["id"], pts, closed=bool(p["closed"]),
-                                              metres_per_pixel=mpp)
+        # Every parcel shares the source's vertices, so one pass over the source's
+        # vertices refreshes all SI coords (pixels unchanged; no re-snapping).
+        self._project.refresh_source_vertices_si(self._source_id, s.metres_per_pixel)
 
     def _persist_polygon(self) -> None:
         """Persist the active boundary to its parcel. If tracing began before a
@@ -575,6 +582,9 @@ class MainWindow(QMainWindow):
             self._active_parcel_id = self._project.create_parcel(self._source_id)
             self._project.save_parcel_polygon(self._active_parcel_id, pts,
                                               closed=closed, metres_per_pixel=mpp)
+            self.canvas.set_active_vertex_ids(
+                self._project.get_parcel_vertex_ids(self._active_parcel_id))
+            self._refresh_snap_vertices()
             self._parcels = self._project.list_parcels(self._source_id)
             self._rebuild_parcel_list()
             index = self._parcel_index(self._active_parcel_id)
@@ -588,11 +598,26 @@ class MainWindow(QMainWindow):
 
         self._project.save_parcel_polygon(self._active_parcel_id, pts,
                                           closed=closed, metres_per_pixel=mpp)
+        # Re-sync vertex ids (new points became vertices; snapping may have
+        # reused others) and the snap set, without disturbing the canvas.
+        self.canvas.set_active_vertex_ids(
+            self._project.get_parcel_vertex_ids(self._active_parcel_id))
+        self._refresh_snap_vertices()
         index = self._parcel_index(self._active_parcel_id)
         if index is not None:
             self._parcels[index]["point_count"] = len(pts)
             self._parcels[index]["closed"] = 1 if closed else 0
             self._update_parcel_list_row(index)
+
+    def _on_vertex_moved(self, vertex_id: int, x: float, y: float) -> None:
+        """A shared vertex was dragged/nudged: move it once, for every parcel
+        that references it. The canvas already moved the active + background
+        drawings; here we persist and refresh the active measurement."""
+        if self._project is None or self._source_id is None:
+            self._update_measure_readout()
+            return
+        self._project.move_vertex(vertex_id, x, y, metres_per_pixel=self._mpp())
+        self._update_measure_readout()
 
     # -- readouts -----------------------------------------------------------
 

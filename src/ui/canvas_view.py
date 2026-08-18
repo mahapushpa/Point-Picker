@@ -35,11 +35,13 @@ from PySide6.QtWidgets import (
     QGraphicsSimpleTextItem, QGraphicsItem,
 )
 
+from ..core.polygon import nearest_vertex_index, SNAP_TOLERANCE_PX
 from ..io.raster import RasterImage
 
 _MARK_COLOR = QColor("#1D9E75")  # scale-calibration markers: accent green (as point_picker.html)
 _POLY_COLOR = QColor("#E8770F")  # boundary-tracing markers: orange, visually distinct
 _ACTIVE_HALO = QColor("#FFFFFF")  # ring around the currently-selected point
+_SNAP_COLOR = QColor("#D6336C")   # snap indicator: magenta, "about to reuse this vertex"
 
 
 def qimage_from_raster(raster: RasterImage) -> QImage:
@@ -71,10 +73,14 @@ class CanvasView(QGraphicsView):
 
     #: Emitted (in image pixel coordinates) when a two-point scale is confirmed.
     twoPointsPicked = Signal(QPointF, QPointF)
-    #: Emitted whenever the traced polygon changes (add / adjust / undo / clear / close).
+    #: Emitted when the traced polygon changes structurally (add / undo / clear /
+    #: close, or moving a not-yet-persisted point).
     polygonChanged = Signal()
     #: Emitted when the polygon is closed (>= 3 points).
     polygonClosed = Signal()
+    #: Emitted (vertex_id, x, y) when an existing shared vertex is moved, so the
+    #: move is applied to every parcel referencing it rather than forking it.
+    vertexMoved = Signal(int, float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -97,14 +103,22 @@ class CanvasView(QGraphicsView):
         self._calib_points: list[QPointF] = []
         self._calib_items: list[QGraphicsItem] = []
 
-        # Polygon-tracing state (the one active, editable boundary).
+        # Polygon-tracing state (the one active, editable boundary). Each point
+        # has a parallel vertex id (None until persisted / not snapped).
         self._tracing = False
         self._poly_points: list[QPointF] = []
+        self._poly_vertex_ids: list[int | None] = []
         self._poly_closed = False
         self._poly_items: list[QGraphicsItem] = []
         self._active_color = _POLY_COLOR
         # Other parcels of the same source, drawn for context (not editable).
+        # Each is a dict: {points, vertex_ids, closed, color, label}.
+        self._bg_polys: list[dict] = []
         self._bg_items: list[QGraphicsItem] = []
+        # Shared-vertex snapping.
+        self._snap_vertices: list[tuple[int, float, float]] = []  # (id, x, y) of source vertices
+        self._snap_indicator: QGraphicsItem | None = None
+        self._snap_hover_id: int | None = None
 
         # Precision crosshair.
         self._crosshair_enabled = False
@@ -130,6 +144,10 @@ class CanvasView(QGraphicsView):
         self._reset_calibration_state()
         self._reset_polygon_state()
         self._bg_items.clear()  # scene.clear() already removed them
+        self._bg_polys.clear()
+        self._snap_vertices.clear()
+        self._snap_indicator = None
+        self._snap_hover_id = None
         self._active = None
         self._drag_kind = self._drag_index = None
         self._pixmap_item = self._scene.addPixmap(pixmap)
@@ -206,6 +224,7 @@ class CanvasView(QGraphicsView):
 
     def stop_polygon(self) -> None:
         self._tracing = False
+        self._clear_snap_indicator()
         self._update_cursor()
         self.viewport().update()
 
@@ -213,6 +232,8 @@ class CanvasView(QGraphicsView):
         if not self._poly_points:
             return
         self._poly_points.pop()
+        if self._poly_vertex_ids:
+            self._poly_vertex_ids.pop()
         self._poly_closed = False
         if self._active is not None and self._active[0] == "poly":
             self._active = ("poly", len(self._poly_points) - 1) if self._poly_points else None
@@ -222,6 +243,7 @@ class CanvasView(QGraphicsView):
     def clear_polygon(self) -> None:
         had_any = bool(self._poly_points)
         self._poly_points.clear()
+        self._poly_vertex_ids.clear()
         self._poly_closed = False
         if self._active is not None and self._active[0] == "poly":
             self._active = None
@@ -235,21 +257,44 @@ class CanvasView(QGraphicsView):
             return False
         self._poly_closed = True
         self._tracing = False
+        self._clear_snap_indicator()
         self._redraw_polygon()
         self._update_cursor()
         self.polygonChanged.emit()
         self.polygonClosed.emit()
         return True
 
-    def set_polygon(self, pixel_points, closed: bool = True) -> None:
-        """Replace the polygon with points restored from storage (image pixels).
-        Does not emit change signals — the caller is loading, not editing."""
+    def set_polygon(self, pixel_points, closed: bool = True, vertex_ids=None) -> None:
+        """Replace the active polygon with points restored from storage (image
+        pixels), optionally with their vertex ids. Does not emit change signals —
+        the caller is loading, not editing."""
         self._poly_points = [QPointF(float(x), float(y)) for x, y in pixel_points]
+        if vertex_ids is not None:
+            self._poly_vertex_ids = [None if v is None else int(v) for v in vertex_ids]
+        else:
+            self._poly_vertex_ids = [None] * len(self._poly_points)
         self._poly_closed = closed and len(self._poly_points) >= 3
         self._tracing = False
         self._active = None
         self._redraw_polygon()
         self._update_cursor()
+
+    def set_active_vertex_ids(self, vertex_ids) -> None:
+        """Attach vertex ids to the current active points (e.g. after a save that
+        created vertices), without touching coordinates or redrawing points."""
+        ids = [None if v is None else int(v) for v in vertex_ids]
+        # Keep aligned with the point list.
+        if len(ids) < len(self._poly_points):
+            ids += [None] * (len(self._poly_points) - len(ids))
+        self._poly_vertex_ids = ids[:len(self._poly_points)]
+
+    def active_vertex_ids(self) -> list[int | None]:
+        return list(self._poly_vertex_ids)
+
+    def set_snap_vertices(self, vertices) -> None:
+        """Provide the source's vertices as (id, x, y) so tracing can snap new
+        points onto existing ones (shared boundaries)."""
+        self._snap_vertices = [(int(vid), float(x), float(y)) for vid, x, y in vertices]
 
     def polygon_points(self) -> list[tuple[float, float]]:
         """Current boundary as ordered (x, y) image-pixel tuples."""
@@ -269,21 +314,34 @@ class CanvasView(QGraphicsView):
 
     def set_background_polygons(self, polygons) -> None:
         """Draw other parcels of the same source for context, non-interactively.
-        *polygons* is a list of ``(points, closed, color, label)`` where points
-        are (x, y) image-pixel tuples. These are visuals only — hit-testing and
-        editing always target the single active boundary."""
+        *polygons* is a list of ``(points, vertex_ids, closed, color, label)``
+        where points are (x, y) image-pixel tuples. Vertex ids let a shared
+        vertex move in lock-step when edited via the active parcel. Visuals only —
+        hit-testing and editing always target the single active boundary."""
+        self._bg_polys = []
+        for points, vertex_ids, closed, color, label in polygons:
+            self._bg_polys.append({
+                "points": [QPointF(float(x), float(y)) for x, y in points],
+                "vertex_ids": [None if v is None else int(v) for v in (vertex_ids or [])],
+                "closed": bool(closed),
+                "color": QColor(color),
+                "label": label,
+            })
+        self._redraw_backgrounds()
+
+    def _redraw_backgrounds(self) -> None:
         self._remove_items(self._bg_items)
-        for points, closed, color, label in polygons:
-            if not points:
+        for poly in self._bg_polys:
+            qpts = poly["points"]
+            if not qpts:
                 continue
-            qcolor = QColor(color)
+            qcolor = QColor(poly["color"])
             qcolor.setAlpha(210)  # slightly muted so the active boundary stands out
             pen = QPen(qcolor)
             pen.setWidth(2)
             pen.setCosmetic(True)
-            qpts = [QPointF(float(x), float(y)) for x, y in points]
             segments = list(zip(qpts, qpts[1:]))
-            if closed and len(qpts) >= 3:
+            if poly["closed"] and len(qpts) >= 3:
                 segments.append((qpts[-1], qpts[0]))
             for a, b in segments:
                 line = QGraphicsLineItem(a.x(), a.y(), b.x(), b.y())
@@ -291,9 +349,9 @@ class CanvasView(QGraphicsView):
                 line.setZValue(1)  # above the pixmap, below the active boundary
                 self._scene.addItem(line)
                 self._bg_items.append(line)
-            if label:
-                text = QGraphicsSimpleTextItem(label)
-                text.setBrush(QColor(color))
+            if poly["label"]:
+                text = QGraphicsSimpleTextItem(poly["label"])
+                text.setBrush(QColor(poly["color"]))
                 text.setPos(qpts[0])
                 text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
                 text.setZValue(2)
@@ -327,6 +385,7 @@ class CanvasView(QGraphicsView):
         if self._tracing:
             self.clear_polygon()             # drops all points + emits change
             self._tracing = False
+            self._clear_snap_indicator()
             self._update_cursor()
             self.viewport().update()
             return True
@@ -406,6 +465,10 @@ class CanvasView(QGraphicsView):
             event.accept()
             return
 
+        # Free hover while tracing: show when the cursor is about to snap.
+        if self._tracing and not self._mouse_down:
+            self._update_snap_indicator(self.mapToScene(pos.toPoint()))
+
         if self._mouse_down and self._last_pan_pos is not None:
             if not self._moved and (pos - self._press_pos).manhattanLength() > self.CLICK_MOVE_THRESHOLD:
                 self._moved = True
@@ -443,6 +506,7 @@ class CanvasView(QGraphicsView):
 
     def leaveEvent(self, event) -> None:
         self._cursor_vp_pos = None
+        self._clear_snap_indicator()
         self.viewport().update()
         super().leaveEvent(event)
 
@@ -474,7 +538,9 @@ class CanvasView(QGraphicsView):
     # -- shared point editing (scene coordinates) ---------------------------
 
     def _place_point(self, scene_pt: QPointF) -> None:
-        """Add a point at *scene_pt* for the active pick mode."""
+        """Add a point at *scene_pt* for the active pick mode. While tracing, a
+        point within SNAP_TOLERANCE_PX of an existing source vertex (not one this
+        parcel already uses) snaps onto it, sharing that vertex."""
         if self._calibrating:
             if len(self._calib_points) >= 2:
                 return  # two points already placed; adjust or confirm/cancel
@@ -482,8 +548,16 @@ class CanvasView(QGraphicsView):
             self._active = ("scale", len(self._calib_points) - 1)
             self._redraw_calibration()
         elif self._tracing:
-            self._poly_points.append(scene_pt)
+            snap = self._snap_target((scene_pt.x(), scene_pt.y()))
+            if snap is not None:
+                vid, sx, sy = snap
+                self._poly_points.append(QPointF(sx, sy))
+                self._poly_vertex_ids.append(vid)
+            else:
+                self._poly_points.append(scene_pt)
+                self._poly_vertex_ids.append(None)
             self._active = ("poly", len(self._poly_points) - 1)
+            self._clear_snap_indicator()
             self._redraw_polygon()
             self.polygonChanged.emit()
 
@@ -496,9 +570,71 @@ class CanvasView(QGraphicsView):
         elif kind == "poly" and 0 <= index < len(self._poly_points):
             self._poly_points[index] = scene_pt
             self._active = ("poly", index)
+            vid = self._poly_vertex_ids[index] if index < len(self._poly_vertex_ids) else None
+            if vid is not None:
+                # Moving an existing shared vertex: move it everywhere it's used.
+                self._apply_vertex_move(vid, scene_pt)
             self._redraw_polygon()
             if emit:
-                self.polygonChanged.emit()
+                if vid is not None:
+                    self.vertexMoved.emit(vid, scene_pt.x(), scene_pt.y())
+                else:
+                    self.polygonChanged.emit()
+
+    def _apply_vertex_move(self, vertex_id: int, scene_pt: QPointF) -> None:
+        """Reflect a shared vertex's new position in every background parcel that
+        references it, and in the live snap set, so the shared edge stays in
+        lock-step on screen."""
+        changed = False
+        for poly in self._bg_polys:
+            for i, vid in enumerate(poly["vertex_ids"]):
+                if vid == vertex_id:
+                    poly["points"][i] = scene_pt
+                    changed = True
+        self._snap_vertices = [(vid, scene_pt.x(), scene_pt.y()) if vid == vertex_id else (vid, x, y)
+                               for (vid, x, y) in self._snap_vertices]
+        if changed:
+            self._redraw_backgrounds()
+
+    def _snap_target(self, point):
+        """Return (vertex_id, x, y) to snap *point* onto, or None. Excludes
+        vertices this parcel already uses (never weld its own corners)."""
+        if not self._snap_vertices:
+            return None
+        exclude = {v for v in self._poly_vertex_ids if v is not None}
+        idx = nearest_vertex_index(point, self._snap_vertices, SNAP_TOLERANCE_PX,
+                                   exclude_ids=exclude)
+        return self._snap_vertices[idx] if idx is not None else None
+
+    def _update_snap_indicator(self, scene_pt: QPointF) -> None:
+        """Show a magenta ring on the vertex the next click would snap to, so the
+        snap is never a surprise. Hidden when no candidate is in range."""
+        snap = self._snap_target((scene_pt.x(), scene_pt.y()))
+        if snap is None:
+            self._clear_snap_indicator()
+            return
+        vid, sx, sy = snap
+        if self._snap_hover_id == vid and self._snap_indicator is not None:
+            return
+        self._clear_snap_indicator()
+        r = 9.0
+        pen = QPen(_SNAP_COLOR)
+        pen.setWidth(2)
+        pen.setCosmetic(True)
+        ring = QGraphicsEllipseItem(-r, -r, 2 * r, 2 * r)
+        ring.setPen(pen)
+        ring.setPos(QPointF(sx, sy))
+        ring.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        ring.setZValue(20)
+        self._scene.addItem(ring)
+        self._snap_indicator = ring
+        self._snap_hover_id = vid
+
+    def _clear_snap_indicator(self) -> None:
+        if self._snap_indicator is not None and self._snap_indicator.scene() is self._scene:
+            self._scene.removeItem(self._snap_indicator)
+        self._snap_indicator = None
+        self._snap_hover_id = None
 
     def _nudge_active(self, dx: float, dy: float) -> None:
         if self._active is None:

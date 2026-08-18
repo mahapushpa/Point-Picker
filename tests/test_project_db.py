@@ -36,7 +36,7 @@ class ProjectDBTests(unittest.TestCase):
             self.assertTrue(p.exports_dir.is_dir())
             self.assertEqual(p.schema_version, SCHEMA_VERSION)
             expected = {"meta", "sources", "unit_profiles", "parcels",
-                        "parcel_fields", "points"}
+                        "parcel_fields", "vertices", "parcel_vertices"}
             self.assertTrue(expected.issubset(set(p.table_names())))
             self.assertEqual(p.get_meta("project_name"), "Test")
 
@@ -264,9 +264,9 @@ class ProjectDBTests(unittest.TestCase):
         with ProjectDB.create(self.tmp / "proj") as p:
             sid = self._source_id(p)
             pid = p.create_parcel(sid)
-            p.save_parcel_polygon(pid, [(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)])
-            p.save_parcel_polygon(pid, [(0.0, 0.0), (5.0, 0.0)])  # re-trace
-            self.assertEqual(p.get_parcel_polygon(pid), [(0.0, 0.0), (5.0, 0.0)])
+            p.save_parcel_polygon(pid, [(0.0, 0.0), (100.0, 100.0), (200.0, 0.0)])
+            p.save_parcel_polygon(pid, [(0.0, 0.0), (500.0, 0.0)])  # re-trace
+            self.assertEqual(p.get_parcel_polygon(pid), [(0.0, 0.0), (500.0, 0.0)])
 
     def test_parcel_polygon_persists_across_reopen(self):
         root = self.tmp / "proj"
@@ -325,12 +325,12 @@ class ProjectDBTests(unittest.TestCase):
             sid = self._source_id(p)
             pa = p.create_parcel(sid)
             pb = p.create_parcel(sid)
-            a = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)]
-            b = [(1.0, 1.0), (2.0, 2.0), (3.0, 1.0)]
+            a = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0)]      # far from b: no sharing
+            b = [(500.0, 500.0), (600.0, 500.0), (550.0, 600.0)]
             p.save_parcel_polygon(pa, a, closed=True)
             p.save_parcel_polygon(pb, b, closed=False)
             # Re-trace A entirely; B must be untouched.
-            p.save_parcel_polygon(pa, [(9.0, 9.0), (8.0, 8.0)], closed=False)
+            p.save_parcel_polygon(pa, [(0.0, 300.0), (100.0, 300.0)], closed=False)
             self.assertEqual(p.get_parcel_polygon(pb), b)
             self.assertFalse(p.get_parcel_closed(pb))
 
@@ -339,13 +339,13 @@ class ProjectDBTests(unittest.TestCase):
             sid = self._source_id(p)
             pa = p.create_parcel(sid)
             pb = p.create_parcel(sid)
-            p.save_parcel_polygon(pa, [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)])
-            p.save_parcel_polygon(pb, [(5.0, 5.0), (6.0, 5.0), (6.0, 6.0)])
+            p.save_parcel_polygon(pa, [(0.0, 0.0), (100.0, 0.0), (0.0, 100.0)])
+            p.save_parcel_polygon(pb, [(500.0, 500.0), (600.0, 500.0), (600.0, 600.0)])
             p.delete_parcel(pa)
             self.assertIsNone(p.get_parcel(pa))
-            self.assertEqual(p.get_parcel_points(pa), [])  # points cascaded away
+            self.assertEqual(p.get_parcel_points(pa), [])  # references cascaded away
             self.assertEqual(len(p.list_parcels(sid)), 1)
-            self.assertEqual(p.get_parcel_polygon(pb), [(5.0, 5.0), (6.0, 5.0), (6.0, 6.0)])
+            self.assertEqual(p.get_parcel_polygon(pb), [(500.0, 500.0), (600.0, 500.0), (600.0, 600.0)])
 
     def test_owner_round_trips(self):
         root = self.tmp / "proj"
@@ -365,6 +365,126 @@ class ProjectDBTests(unittest.TestCase):
         with ProjectDB.create(self.tmp / "proj") as p:
             sid = self._source_id(p)
             self.assertEqual(p.list_parcels(sid), [])
+
+    # -- shared vertices / topology (Milestone 6) ---------------------------
+
+    def _two_adjacent_parcels(self, p):
+        """Parcels A and B sharing the vertical edge x=100 (two shared corners)."""
+        sid = self._source_id(p)
+        pa = p.create_parcel(sid, owner="A")
+        pb = p.create_parcel(sid, owner="B")
+        A = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]
+        B = [(100.0, 0.0), (200.0, 0.0), (200.0, 100.0), (100.0, 100.0)]
+        p.save_parcel_polygon(pa, A, closed=True, metres_per_pixel=0.5)
+        p.save_parcel_polygon(pb, B, closed=True, metres_per_pixel=0.5)
+        return sid, pa, pb
+
+    def test_adjacent_parcels_share_edge_vertices(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid, pa, pb = self._two_adjacent_parcels(p)
+            shared = set(p.get_parcel_vertex_ids(pa)) & set(p.get_parcel_vertex_ids(pb))
+            self.assertEqual(len(shared), 2)                 # the common edge's two corners
+            self.assertEqual(len(p.list_vertices(sid)), 6)   # 4 + 4 - 2 shared
+
+    def test_moving_shared_vertex_updates_both_parcels_and_measures(self):
+        from src.core.geometry import measure_polygon
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid, pa, pb = self._two_adjacent_parcels(p)
+            shared = set(p.get_parcel_vertex_ids(pa)) & set(p.get_parcel_vertex_ids(pb))
+            target = next(v["id"] for v in p.list_vertices(sid)
+                          if v["id"] in shared and v["pixel_x"] == 100.0 and v["pixel_y"] == 0.0)
+            self.assertEqual(set(p.parcels_referencing_vertex(target)), {pa, pb})
+            area_a0 = measure_polygon(p.get_parcel_polygon(pa), 0.5, closed=True).area_sq_m
+            area_b0 = measure_polygon(p.get_parcel_polygon(pb), 0.5, closed=True).area_sq_m
+            p.move_vertex(target, 100.0, -40.0, metres_per_pixel=0.5)   # move the shared corner
+            poly_a, poly_b = p.get_parcel_polygon(pa), p.get_parcel_polygon(pb)
+            self.assertIn((100.0, -40.0), poly_a)            # moved for A
+            self.assertIn((100.0, -40.0), poly_b)            # and for B
+            self.assertNotAlmostEqual(area_a0, measure_polygon(poly_a, 0.5, closed=True).area_sq_m)
+            self.assertNotAlmostEqual(area_b0, measure_polygon(poly_b, 0.5, closed=True).area_sq_m)
+
+    def test_same_parcel_near_corners_not_merged(self):
+        """Two of a parcel's OWN corners within SNAP_TOLERANCE_PX must stay
+        distinct — never welded into one."""
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            pid = p.create_parcel(sid)
+            pts = [(0.0, 0.0), (3.0, 0.0), (1.0, 50.0)]      # (0,0)-(3,0) is 3px < 8px
+            p.save_parcel_polygon(pid, pts)
+            self.assertEqual(p.get_parcel_polygon(pid), pts)  # both corners preserved
+            self.assertEqual(len(set(p.get_parcel_vertex_ids(pid))), 3)  # 3 distinct vertices
+
+    def test_cross_parcel_near_point_merges(self):
+        """A *different* parcel's point within tolerance snaps onto the vertex."""
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            pa = p.create_parcel(sid)
+            pb = p.create_parcel(sid)
+            p.save_parcel_polygon(pa, [(0.0, 0.0), (100.0, 0.0), (50.0, 100.0)])
+            p.save_parcel_polygon(pb, [(103.0, 0.0), (300.0, 0.0), (200.0, 100.0)])  # 103 ~ 100
+            self.assertEqual(p.get_parcel_polygon(pb)[0], (100.0, 0.0))  # adopted A's vertex
+            shared = set(p.get_parcel_vertex_ids(pa)) & set(p.get_parcel_vertex_ids(pb))
+            self.assertEqual(len(shared), 1)
+
+    def test_parcel_with_no_shared_vertices_independent(self):
+        """A parcel that shares nothing behaves exactly as before."""
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            pa = p.create_parcel(sid)
+            pb = p.create_parcel(sid)
+            B = [(500.0, 500.0), (600.0, 500.0), (550.0, 600.0)]
+            p.save_parcel_polygon(pa, [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0)], closed=True)
+            p.save_parcel_polygon(pb, B, closed=True)
+            self.assertEqual(set(p.get_parcel_vertex_ids(pa)) & set(p.get_parcel_vertex_ids(pb)), set())
+            p.move_vertex(p.get_parcel_vertex_ids(pa)[0], 5.0, 5.0)   # move one of A's vertices
+            self.assertEqual(p.get_parcel_polygon(pb), B)             # B untouched
+            p.delete_parcel(pa)
+            self.assertEqual(p.get_parcel_polygon(pb), B)             # still untouched
+
+    def test_orphan_vertices_pruned_on_retrace(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            pid = p.create_parcel(sid)
+            p.save_parcel_polygon(pid, [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)])
+            self.assertEqual(len(p.list_vertices(sid)), 4)
+            p.save_parcel_polygon(pid, [(0.0, 0.0), (200.0, 0.0)])  # drops 3 far corners
+            self.assertEqual(len(p.list_vertices(sid)), 2)          # orphans pruned
+
+    def test_v4_points_migrate_to_shared_vertices(self):
+        """A v4 file (per-parcel `points`) rebuilds into shared vertices on open,
+        deduplicating the shared edge across two adjacent parcels."""
+        root = self.tmp / "legacy4"
+        with ProjectDB.create(root) as p:
+            sid = self._source_id(p)
+            pa = p.create_parcel(sid, owner="A")
+            pb = p.create_parcel(sid, owner="B")
+        conn = sqlite3.connect(str(root / "project.db"))
+        conn.executescript(
+            "DROP TABLE parcel_vertices;"
+            "DROP TABLE vertices;"
+            "CREATE TABLE points (id INTEGER PRIMARY KEY AUTOINCREMENT, parcel_id INTEGER,"
+            " seq INTEGER, label TEXT, pixel_x REAL, pixel_y REAL, local_x REAL, local_y REAL,"
+            " lat REAL, lon REAL);"
+        )
+        A = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]
+        B = [(100.0, 0.0), (200.0, 0.0), (200.0, 100.0), (100.0, 100.0)]  # shares A's right edge
+        for seq, (x, y) in enumerate(A):
+            conn.execute("INSERT INTO points (parcel_id, seq, pixel_x, pixel_y) VALUES (?, ?, ?, ?)",
+                         (pa, seq, x, y))
+        for seq, (x, y) in enumerate(B):
+            conn.execute("INSERT INTO points (parcel_id, seq, pixel_x, pixel_y) VALUES (?, ?, ?, ?)",
+                         (pb, seq, x, y))
+        conn.execute("PRAGMA user_version = 4")
+        conn.commit()
+        conn.close()
+        with ProjectDB.open(root) as p2:
+            self.assertEqual(p2.schema_version, SCHEMA_VERSION)
+            self.assertNotIn("points", p2.table_names())        # old table dropped
+            self.assertEqual(p2.get_parcel_polygon(pa), A)      # geometry preserved
+            self.assertEqual(p2.get_parcel_polygon(pb), B)
+            shared = set(p2.get_parcel_vertex_ids(pa)) & set(p2.get_parcel_vertex_ids(pb))
+            self.assertEqual(len(shared), 2)                    # shared edge deduped by migration
+            self.assertEqual(len(p2.list_vertices(sid)), 6)
 
     # -- closed/open state persistence (v3) ---------------------------------
 

@@ -135,6 +135,15 @@ Use multiple methods and cross-validate when more than one is available:
   multiple parcels, used for owner-wise reporting (see Reporting below).
 
 ## Measurement & unit handling
+**Scale-first rule (applies to every real-world measurement output —
+area, perimeter, segment length, and location distance/bearing alike):**
+no real-world number is ever shown or exported without a scale set for
+that source. This already matches what M3/M4 built — tracing without
+scale is allowed and shows "(no scale)" rather than blocking the user,
+but no *measurement value* is ever produced until scale exists. The one
+operation that's scale-independent is noise/image cleaning — it doesn't
+need scale, and doing it first can make scale-setting itself easier (a
+cleaner scan makes a scale bar or grid line easier to click precisely).
 - Perimeter = sum of segment distances between consecutive polygon points
 - Area = shoelace formula on the closed polygon (real-world coordinates, not
   pixels)
@@ -181,36 +190,113 @@ All exports: PDF (primary, shareable) and CSV/JSON (record-keeping /
 import elsewhere). Each report also carries: scale-determination method
 used and its confidence/cross-check note, and source file reference.
 
+## Topology-aware shared parcel boundaries (confirmed requirement)
+Adjacent khasras share a boundary edge in real surveys. Tracing each
+parcel as a fully independent list of points (as M4/M5 currently do) means
+the shared edge gets traced twice, and tiny differences between the two
+traces produce gaps, slivers, or overlaps between neighbors — the summed
+area of individually-traced parcels then doesn't cleanly equal the sheet's
+recorded total, which is a real correctness problem for land records, not
+a cosmetic one.
+
+Fix: move from "each parcel stores its own points" to a shared-vertex
+model, similar to how professional GIS tools handle polygon topology —
+- A vertex is stored once (pixel + SI + optional lat/lon coordinates) and
+  referenced, in order, by every parcel whose boundary passes through it.
+- Moving a shared vertex moves it for every parcel referencing it — a
+  shared edge is structurally guaranteed to match, not just visually close.
+- When marking a new boundary point near an existing vertex (within a
+  small snap tolerance), the tracing tool snaps to and reuses the existing
+  vertex rather than creating a new, nearly-identical one.
+- Parcels store an ordered list of vertex references, not raw coordinates.
+
+This changes the polygon storage introduced in M1/M4/M5, so it should be
+done now, while only test parcels exist, rather than after real khasras
+have been traced the independent way — migrating real traced data into a
+shared-vertex model later would be significantly more costly than building
+it correctly now.
+
+## Parcel selection (multi-select)
+Needed once a sheet has many parcels (e.g. a whole village upload) — most
+bulk operations (a location-fix, a report covering only some khasras)
+should act on a **user-chosen working subset**, not automatically "all
+parcels on this sheet" (too many to be useful) or force the user to
+identify parcels one at a time by number (khasra numbers are often
+hand-written and impractical to type reliably). Selection should work by
+marking on the canvas — click a parcel to toggle it into/out of the
+selection, or a marquee/lasso to select several at once by their
+boundaries or proximity, since neighboring khasras are typically touching
+or very close together. Selection is a distinct state from the "active
+parcel for editing" concept introduced in M5 — visually distinguishable
+from both the active-editing highlight and the background context color.
+This selection mechanism is used by location-fixing (below) and can also
+scope reporting to a chosen subset of parcels.
 ## Location fixing (local georeferencing)
+**Purpose, clarified**: this is primarily for identifying **encroachment**
+— determining where a parcel's recorded, already-known boundary actually
+sits on the ground relative to real, durable landmarks (tubewell,
+building, school, water tank), so encroached land can be identified and
+returned to its rightful owner. This is informal and localized — the
+result is not submitted back to the revenue department as an official
+re-survey — so field-reproducible accuracy (a distance and bearing a
+person could verify with a tape and compass) matters more than
+geodetic-grade absolute precision.
+
+**Depends on the same per-source scale as area (M3)**: distance/bearing
+output requires converting pixel distances to real units, so location-
+fixing reuses the existing per-source scale factor — it does not compute
+or maintain a separate scale of its own. If a source has no scale set yet
+when a location-fix is started (a real possibility given the "locate
+first" ordering above), the tool should prompt to set scale first (the
+same M3 flow), since the distance/bearing result is meaningless without it.
+
+**Separate flow**: location-fixing is its own canvas mode, mutually
+exclusive with scale calibration and polygon tracing (the same pattern M4
+already established between those two) — not a feature mixed into the
+tracing flow. The reference points and the resulting distance/bearing are
+a distinct step; once computed, the result attaches to a parcel record,
+but arriving at it doesn't require being mid-trace or interleaved with
+tracing UI state.
+
+**Usage frequency (informs priority, doesn't change scope)**: area-only is
+by far the most common session; location + area together is less common;
+location alone is rare. This is why location-fixing sits late in the
+milestone order (15) — most sessions never touch it, so it correctly
+doesn't block anything ahead of it.
+
+**Workflow order, when location-fixing IS used**: locate first, then
+measure, then hand the result to the user — not the reverse. Reference-
+point marking must work as an independent step on the sheet, usable
+before, after, or without a traced parcel boundary — it must not be built
+as something that only becomes available once a parcel is fully traced.
+
+**Scope**: applies to a user-selected subset of parcels (see Parcel
+selection above), not automatically every parcel on an uploaded sheet.
+
 A second core hard problem, structurally parallel to scale-determination
 but solving for *position* instead of *size*. The user marks well-defined,
-durable reference features already visible on the sheet — tubewell,
-building, or other long-lived structures (school, water tank) — the same
-way scale-calibration points are marked. Two modes, since what's known
-about those reference points varies by survey age:
+durable reference features already visible on the sheet — the same way
+scale-calibration points are marked. Two modes, since what's known about
+those reference points varies by survey age:
 
-1. **GPS-anchored mode** (modern surveys, or older surveys where the
-   landmark still exists and can be located today). The user supplies known
-   real-world GPS coordinates for each marked reference point. With 2+
-   points, compute a coordinate transform between sheet-pixel space and
-   real-world GPS space, giving the traced parcel an absolute location —
-   and as a side benefit, this also cross-checks against the scale factor
-   from Milestone 3, since GPS-anchored reference points imply a scale too.
-2. **Distance/trigonometry mode** (older surveys, no GPS available). The
-   user supplies a known real-world distance (and bearing, if known) from a
-   reference point to the parcel. Position is computed by trigonometry —
-   this doesn't require the reference point's own absolute coordinates,
-   only the relationship between it and the parcel, so it still works when
-   nothing on the sheet has ever been GPS-surveyed.
+1. **Distance/trigonometry mode — primary, build this first.** The user
+   supplies a known real-world distance (and bearing, if known) from a
+   reference point to the parcel boundary. Position is computed by
+   trigonometry and doesn't require the reference point's own absolute
+   coordinates — only its relationship to the parcel — matching how this
+   is actually done in the field and how older surveys (with no GPS) work.
+   **Output: a distance + bearing description** (e.g. "38 m from the
+   tubewell, bearing 42°"), attached to the parcel and usable in reports.
+2. **GPS-anchored mode — documented, but optional/deferred.** If the
+   reference point's real-world GPS coordinates are known (modern surveys,
+   or an old landmark that still exists and can be located today), 2+
+   points give a full coordinate transform and an absolute location. Not
+   required for the primary encroachment-detection use case; worth adding
+   later since the reference-point-marking mechanism is shared with mode 1.
 3. **Cross-validation** — same principle as scale-determination: when 3+
-   reference points are available, compare the position each one implies
-   and surface disagreement rather than trusting one silently. With only
-   one weak reference, say so explicitly rather than presenting a
-   confident-looking location.
-
-Output: the parcel's location description (GPS coordinates where available,
-otherwise "X m from [landmark] bearing Y°"), attached to the parcel record
-and included in reports where location was requested, not just area.
+   reference points are available, compare the position each implies and
+   surface disagreement rather than trusting one silently. With only one
+   weak reference, say so explicitly.
 
 ## Data quality / noise handling
 Two distinct pieces, different risk profiles:
@@ -384,33 +470,44 @@ some-parcel-project/
 4. ✅ Polygon point-marking with live segment/perimeter/area readout, saved
    to the project DB, incl. fine-tune/nudge, reliable cancel, precision
    crosshair, and the explicit `closed` state — done
-5. **Multi-parcel per source** — several khasra boundaries traced and
+5. ✅ Multi-parcel per source — several khasra boundaries traced and
    measured independently on one loaded sheet, each its own parcel record;
-   owner as a linking field across a source's parcels
-6. Unit profiles: sq m / sq ft / acre / hectare built in, plus user-defined
+   owner as a linking field across a source's parcels — done
+6. **Topology-aware shared parcel boundaries** — move from per-parcel
+   independent points to shared vertices referenced by multiple parcels,
+   with snap-to-existing-vertex when tracing adjacent boundaries. Do this
+   now, before more real (non-test) parcels are traced the independent way
+7. **Parcel selection (multi-select)** — click/marquee selection of a
+   working subset of parcels on the canvas, distinct from the M5 "active
+   parcel" concept; used by location-fixing (16) and report scoping (11-12)
+8. **Image preprocessing** (denoise/contrast) for scans — no dependency on
+   scale, can make scale-setting itself more accurate on rough scans;
+   moved up since it's a foundational, low-risk win with no blockers
+9. Unit profiles: sq m / sq ft / acre / hectare built in, plus user-defined
    local unit profiles (save/select, e.g. a "Bigha — Jaipur" profile)
-7. Land-type templates (rural-agri / rural-residential / urban) + editable
-   identification-fields form, tied to a traced parcel, incl. owner field
-8. Owner-wise summary report (all parcels for an owner + total), PDF/CSV/
-   JSON export
-9. Segment-length / boundary-description report — separate report type,
-   user-selectable segments
-10. Visual confidence overlay — traced boundary shown over the source scan,
+10. Land-type templates (rural-agri / rural-residential / urban) + editable
+    identification-fields form, tied to a traced parcel, incl. owner field
+11. Owner-wise summary report (all parcels for an owner + total), PDF/CSV/
+    JSON export
+12. Segment-length / boundary-description report — separate report type,
+    user-selectable segments
+13. Visual confidence overlay — traced boundary shown over the source scan,
     toggleable per parcel
-11. PDF metadata-based scale auto-detection, shown alongside manual entry
+14. PDF metadata-based scale auto-detection, shown alongside manual entry
     for comparison
-12. DXF support (open file, read header units/scale, render entities)
-13. Location-fixing (local georeferencing): mark on-sheet reference points
-    (tubewell, building, other durable structures), GPS-anchored mode and
-    distance/trigonometry mode, cross-validated when 3+ references are used
-14. Image preprocessing (denoise/contrast) for scans — helps manual tracing
-    precision now, and is a prerequisite for milestone 16
-15. Point-data guard rails — flag (don't auto-correct) likely-accidental
+15. DXF support (open file, read header units/scale, render entities)
+16. **Location-fixing (local georeferencing)** — encroachment-detection use
+    case: mark on-sheet reference points (tubewell, building, other durable
+    structures) for a user-selected subset of parcels (7); build
+    distance/trigonometry mode first (primary output: distance + bearing
+    from a landmark), GPS-anchored mode documented but optional/deferred;
+    cross-validated when 3+ references are used
+17. Point-data guard rails — flag (don't auto-correct) likely-accidental
     duplicate/near points at placement time
-16. Semi-automated tracing assist — follow a printed/drawn boundary line
+18. Semi-automated tracing assist — follow a printed/drawn boundary line
     between two user-marked points, always shown for confirmation before
     being accepted, manual tracing remains the fallback
-17. Grid/reference-content auto-detection (hardest, do last)
+19. Grid/reference-content auto-detection (hardest, do last)
 
 ## Attached reference files
 - `point_picker.html` — working browser-based point-marking prototype

@@ -28,6 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 import shutil
 
+from .polygon import nearest_vertex_index, SNAP_TOLERANCE_PX
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -40,7 +42,10 @@ import shutil
 #: no data migration and no breaking change. v2 added ``source_scales``;
 #: v3 added ``parcels.closed``; v4 added ``parcels.owner``. Multiple parcels per
 #: source needed no schema change (parcels.source_id already allows many rows).
-SCHEMA_VERSION = 4
+#: v5 is a *restructuring* (not additive): the per-parcel ``points`` table is
+#: replaced by shared ``vertices`` + ``parcel_vertices``, with a dedicated
+#: rebuild migration (see ``_migrate_points_to_vertices``).
+SCHEMA_VERSION = 5
 
 DB_FILENAME = "project.db"
 SOURCES_DIRNAME = "sources"
@@ -113,13 +118,13 @@ CREATE TABLE IF NOT EXISTS parcel_fields (
     value     TEXT
 );
 
--- Ordered boundary points forming a closed polygon. lat/lon are present from
--- day one (Phase 2 GPS capture) but unused today.
-CREATE TABLE IF NOT EXISTS points (
+-- Boundary vertices (Milestone 6: topology-aware shared boundaries). A vertex
+-- is stored ONCE per source and shared by every parcel whose boundary passes
+-- through it, so a shared edge is structurally guaranteed to match. Coordinates
+-- live here; lat/lon are present from day one (Phase 2 GPS) but unused today.
+CREATE TABLE IF NOT EXISTS vertices (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    parcel_id INTEGER NOT NULL REFERENCES parcels(id) ON DELETE CASCADE,
-    seq       INTEGER NOT NULL,                          -- order around the boundary
-    label     TEXT,
+    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
     pixel_x   REAL    NOT NULL,
     pixel_y   REAL    NOT NULL,
     local_x   REAL,                                      -- real-world metres (X)
@@ -128,7 +133,17 @@ CREATE TABLE IF NOT EXISTS points (
     lon       REAL
 );
 
-CREATE INDEX IF NOT EXISTS idx_points_parcel ON points(parcel_id, seq);
+-- A parcel's boundary as an ORDERED list of vertex references (not raw coords).
+CREATE TABLE IF NOT EXISTS parcel_vertices (
+    parcel_id INTEGER NOT NULL REFERENCES parcels(id)  ON DELETE CASCADE,
+    seq       INTEGER NOT NULL,                          -- order around the boundary
+    vertex_id INTEGER NOT NULL REFERENCES vertices(id) ON DELETE CASCADE,
+    PRIMARY KEY (parcel_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vertices_source ON vertices(source_id);
+CREATE INDEX IF NOT EXISTS idx_parcel_vertices_vertex ON parcel_vertices(vertex_id);
+CREATE INDEX IF NOT EXISTS idx_parcel_vertices_parcel ON parcel_vertices(parcel_id, seq);
 CREATE INDEX IF NOT EXISTS idx_fields_parcel ON parcel_fields(parcel_id, seq);
 
 -- Established real-world scale for a source file (Milestone 3). One row per
@@ -251,11 +266,10 @@ class ProjectDB:
         """Open an existing project folder.
 
         A file written by a *newer* code version than this one is rejected
-        loudly. A file from an *older* version is upgraded in place: because
-        every schema change is additive (new tables and new columns only),
-        re-running the idempotent schema script and adding any missing columns
-        brings the file up to date without touching existing data, and the
-        stored version is bumped to match.
+        loudly. A file from an *older* version is upgraded in place: additive
+        changes (new tables/columns for v2-v4) apply idempotently, and the v5
+        restructuring rebuilds any per-parcel ``points`` into shared vertices.
+        The stored version is then bumped to match.
         """
         root = Path(root).resolve()
         db_path = root / DB_FILENAME
@@ -271,10 +285,14 @@ class ProjectDB:
                 f"(version {SCHEMA_VERSION}); update the application to open it."
             )
         if found < SCHEMA_VERSION:
-            # Additive-only upgrade: new tables (v2 source_scales) and new
-            # columns (v3 parcels.closed).
-            conn.executescript(SCHEMA_SQL)
-            _ensure_additive_columns(conn)
+            conn.executescript(SCHEMA_SQL)   # new tables (source_scales, vertices, parcel_vertices)
+            _ensure_additive_columns(conn)   # new columns (parcels.closed / owner)
+            if _table_exists(conn, "points"):
+                # v5 restructuring: rebuild per-parcel points as shared vertices,
+                # then drop the old table. Safe as a clean rebuild since only
+                # test parcels exist at this milestone.
+                _migrate_points_to_vertices(conn)
+                conn.execute("DROP TABLE points")
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
@@ -437,13 +455,14 @@ class ProjectDB:
         self.conn.execute("DELETE FROM source_scales WHERE source_id = ?", (source_id,))
         self.conn.commit()
 
-    # -- parcels & polygon points (Milestone 5: many parcels per source) ----
+    # -- parcels & shared vertices (Milestone 6) ----------------------------
     #
-    # A source can carry several independently-traced parcels (khasra
-    # boundaries), each its own row keyed by parcel id. Points are stored in
-    # boundary order; pixel coordinates are canonical, and local_x/local_y are
-    # populated in SI when a scale is available so the DB always carries the
-    # metric coordinates too (refreshed whenever the polygon or scale changes).
+    # A source can carry several parcels; a parcel's boundary is an ordered list
+    # of references into the source's shared `vertices`. Two parcels reference
+    # the same vertex where their boundaries meet, so a shared edge is
+    # structurally identical, and moving that vertex moves it for both. Snapping
+    # (dedup) on save reuses an existing vertex when a point lands within
+    # SNAP_TOLERANCE_PX of it — but never one already used by the SAME parcel.
     # `owner` links a source's parcels for owner-wise reporting.
 
     def create_parcel(self, source_id: int, *, name: str | None = None,
@@ -461,11 +480,11 @@ class ProjectDB:
         return int(cur.lastrowid)
 
     def list_parcels(self, source_id: int) -> list[dict]:
-        """All parcels for a source, in creation order, each with its live point
+        """All parcels for a source, in creation order, each with its live vertex
         count (for a list/sidebar)."""
         rows = self.conn.execute(
             "SELECT p.id, p.source_id, p.name, p.owner, p.closed, p.created_at, p.updated_at, "
-            "  (SELECT COUNT(*) FROM points WHERE parcel_id = p.id) AS point_count "
+            "  (SELECT COUNT(*) FROM parcel_vertices WHERE parcel_id = p.id) AS point_count "
             "FROM parcels p WHERE p.source_id = ? ORDER BY p.id", (source_id,)
         ).fetchall()
         return [dict(r) for r in rows]
@@ -496,38 +515,65 @@ class ProjectDB:
         self.conn.commit()
 
     def delete_parcel(self, parcel_id: int) -> None:
-        """Delete a parcel and its points (ON DELETE CASCADE)."""
+        """Delete a parcel and its vertex references (ON DELETE CASCADE), then
+        prune any vertices left unreferenced by any parcel."""
+        source_id = None
+        row = self.conn.execute("SELECT source_id FROM parcels WHERE id = ?", (parcel_id,)).fetchone()
+        if row is not None:
+            source_id = row["source_id"]
         self.conn.execute("DELETE FROM parcels WHERE id = ?", (parcel_id,))
+        if source_id is not None:
+            self._prune_orphan_vertices(source_id)
         self.conn.commit()
 
     def save_parcel_polygon(self, parcel_id: int, pixel_points: list[tuple[float, float]],
                             *, closed: bool = False,
                             metres_per_pixel: float | None = None) -> None:
         """Replace *parcel_id*'s boundary with *pixel_points* (in order) and
-        record its *closed* state. Local (SI) coordinates are stored when a scale
-        is given. An empty list clears the boundary but keeps the parcel row."""
-        if self.conn.execute("SELECT 1 FROM parcels WHERE id = ?", (parcel_id,)).fetchone() is None:
+        record its *closed* state. Each point snaps to an existing source vertex
+        within SNAP_TOLERANCE_PX (never one already used by this parcel) or
+        creates a new one. Orphaned vertices are pruned. An empty list clears the
+        boundary but keeps the parcel row."""
+        parcel = self.conn.execute(
+            "SELECT source_id FROM parcels WHERE id = ?", (parcel_id,)).fetchone()
+        if parcel is None:
             raise ProjectError(f"No parcel with id {parcel_id} in this project.")
-        self.conn.execute("DELETE FROM points WHERE parcel_id = ?", (parcel_id,))
-        for i, (px, py) in enumerate(pixel_points):
-            lx = ly = None
-            if metres_per_pixel is not None:
-                lx, ly = px * metres_per_pixel, py * metres_per_pixel
+        source_id = parcel["source_id"]
+
+        self.conn.execute("DELETE FROM parcel_vertices WHERE parcel_id = ?", (parcel_id,))
+        # Candidate vertices for snapping: all of the source's vertices, growing
+        # as we create new ones this call. `used` excludes this parcel's own.
+        candidates = [(v["id"], v["pixel_x"], v["pixel_y"])
+                      for v in self.list_vertices(source_id)]
+        used_ids: set[int] = set()
+        for seq, (px, py) in enumerate(pixel_points):
+            idx = nearest_vertex_index((px, py), candidates, SNAP_TOLERANCE_PX,
+                                       exclude_ids=used_ids)
+            if idx is not None:
+                vid = candidates[idx][0]                 # reuse a shared/unclaimed vertex
+            else:
+                vid = self._create_vertex(source_id, px, py, metres_per_pixel)
+                candidates.append((vid, float(px), float(py)))
             self.conn.execute(
-                "INSERT INTO points (parcel_id, seq, label, pixel_x, pixel_y, local_x, local_y) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (parcel_id, i, str(i + 1), float(px), float(py), lx, ly),
+                "INSERT INTO parcel_vertices (parcel_id, seq, vertex_id) VALUES (?, ?, ?)",
+                (parcel_id, seq, vid),
             )
+            used_ids.add(vid)
+
         self.conn.execute(
             "UPDATE parcels SET updated_at = ?, closed = ? WHERE id = ?",
             (_utcnow(), 1 if closed else 0, parcel_id),
         )
+        self._prune_orphan_vertices(source_id)
         self.conn.commit()
 
     def get_parcel_points(self, parcel_id: int) -> list[dict]:
+        """Ordered boundary points of a parcel, resolved through its vertices."""
         rows = self.conn.execute(
-            "SELECT seq, label, pixel_x, pixel_y, local_x, local_y, lat, lon "
-            "FROM points WHERE parcel_id = ? ORDER BY seq", (parcel_id,)
+            "SELECT pv.seq AS seq, pv.vertex_id AS vertex_id, "
+            "  v.pixel_x, v.pixel_y, v.local_x, v.local_y, v.lat, v.lon "
+            "FROM parcel_vertices pv JOIN vertices v ON pv.vertex_id = v.id "
+            "WHERE pv.parcel_id = ? ORDER BY pv.seq", (parcel_id,)
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -535,11 +581,83 @@ class ProjectDB:
         """The parcel's boundary as ordered (pixel_x, pixel_y) tuples."""
         return [(p["pixel_x"], p["pixel_y"]) for p in self.get_parcel_points(parcel_id)]
 
+    def get_parcel_vertex_ids(self, parcel_id: int) -> list[int]:
+        """The ordered vertex ids of a parcel's boundary (so callers know which
+        vertices are shared with other parcels)."""
+        rows = self.conn.execute(
+            "SELECT vertex_id FROM parcel_vertices WHERE parcel_id = ? ORDER BY seq",
+            (parcel_id,)
+        ).fetchall()
+        return [r["vertex_id"] for r in rows]
+
     def get_parcel_closed(self, parcel_id: int) -> bool:
         """The parcel's stored closed/open state (the *saved* state, not inferred
         from point count — an open 3+-point boundary reloads as open)."""
         row = self.conn.execute("SELECT closed FROM parcels WHERE id = ?", (parcel_id,)).fetchone()
         return bool(row["closed"]) if row is not None else False
+
+    # -- vertices (shared across a source's parcels) ------------------------
+
+    def list_vertices(self, source_id: int) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT id, pixel_x, pixel_y, local_x, local_y, lat, lon "
+            "FROM vertices WHERE source_id = ? ORDER BY id", (source_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def move_vertex(self, vertex_id: int, pixel_x: float, pixel_y: float, *,
+                    metres_per_pixel: float | None = None) -> None:
+        """Move a vertex — this moves it for **every** parcel referencing it."""
+        lx = ly = None
+        if metres_per_pixel is not None:
+            lx, ly = pixel_x * metres_per_pixel, pixel_y * metres_per_pixel
+        self.conn.execute(
+            "UPDATE vertices SET pixel_x = ?, pixel_y = ?, local_x = ?, local_y = ? WHERE id = ?",
+            (float(pixel_x), float(pixel_y), lx, ly, vertex_id),
+        )
+        now = _utcnow()
+        for pid in self.parcels_referencing_vertex(vertex_id):
+            self.conn.execute("UPDATE parcels SET updated_at = ? WHERE id = ?", (now, pid))
+        self.conn.commit()
+
+    def parcels_referencing_vertex(self, vertex_id: int) -> list[int]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT parcel_id FROM parcel_vertices WHERE vertex_id = ? ORDER BY parcel_id",
+            (vertex_id,)
+        ).fetchall()
+        return [r["parcel_id"] for r in rows]
+
+    def refresh_source_vertices_si(self, source_id: int, metres_per_pixel: float | None) -> None:
+        """Recompute every vertex's SI (local_x/local_y) for the source when the
+        scale changes. Pixel coordinates are unchanged."""
+        if metres_per_pixel is None:
+            self.conn.execute(
+                "UPDATE vertices SET local_x = NULL, local_y = NULL WHERE source_id = ?",
+                (source_id,))
+        else:
+            self.conn.execute(
+                "UPDATE vertices SET local_x = pixel_x * ?, local_y = pixel_y * ? "
+                "WHERE source_id = ?",
+                (metres_per_pixel, metres_per_pixel, source_id))
+        self.conn.commit()
+
+    def _create_vertex(self, source_id: int, px: float, py: float,
+                    metres_per_pixel: float | None) -> int:
+        lx = ly = None
+        if metres_per_pixel is not None:
+            lx, ly = px * metres_per_pixel, py * metres_per_pixel
+        cur = self.conn.execute(
+            "INSERT INTO vertices (source_id, pixel_x, pixel_y, local_x, local_y) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (source_id, float(px), float(py), lx, ly),
+        )
+        return int(cur.lastrowid)
+
+    def _prune_orphan_vertices(self, source_id: int) -> None:
+        """Delete vertices of a source no longer referenced by any parcel."""
+        self.conn.execute(
+            "DELETE FROM vertices WHERE source_id = ? AND id NOT IN "
+            "(SELECT vertex_id FROM parcel_vertices)", (source_id,))
 
     # -- unit profiles ------------------------------------------------------
 
@@ -597,6 +715,50 @@ def _ensure_additive_columns(conn: sqlite3.Connection) -> None:
         present = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         if column not in present:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", (name,)
+    ).fetchone() is not None
+
+
+def _migrate_points_to_vertices(conn: sqlite3.Connection) -> None:
+    """v4 -> v5 rebuild: turn each parcel's independent `points` into references
+    into a shared per-source `vertices` set, deduplicating points within
+    SNAP_TOLERANCE_PX so adjacent parcels that traced the same corner end up
+    sharing one vertex. A parcel never merges two of its *own* points (they are
+    excluded from its snap candidates), so a parcel's shape is preserved."""
+    parcels = conn.execute("SELECT id, source_id FROM parcels ORDER BY id").fetchall()
+    created: dict[int, list[tuple[int, float, float]]] = {}  # source_id -> [(vid, x, y)]
+    for parcel in parcels:
+        pid, sid = parcel["id"], parcel["source_id"]
+        source_verts = created.setdefault(sid, [])
+        pts = conn.execute(
+            "SELECT pixel_x, pixel_y, local_x, local_y, lat, lon "
+            "FROM points WHERE parcel_id = ? ORDER BY seq", (pid,)
+        ).fetchall()
+        used_ids: set[int] = set()
+        for seq, pt in enumerate(pts):
+            point = (pt["pixel_x"], pt["pixel_y"])
+            idx = nearest_vertex_index(point, source_verts, SNAP_TOLERANCE_PX,
+                                       exclude_ids=used_ids)
+            if idx is not None:
+                vid = source_verts[idx][0]
+            else:
+                cur = conn.execute(
+                    "INSERT INTO vertices (source_id, pixel_x, pixel_y, local_x, local_y, lat, lon) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (sid, pt["pixel_x"], pt["pixel_y"], pt["local_x"], pt["local_y"],
+                     pt["lat"], pt["lon"]),
+                )
+                vid = int(cur.lastrowid)
+                source_verts.append((vid, pt["pixel_x"], pt["pixel_y"]))
+            conn.execute(
+                "INSERT INTO parcel_vertices (parcel_id, seq, vertex_id) VALUES (?, ?, ?)",
+                (pid, seq, vid),
+            )
+            used_ids.add(vid)
 
 
 def _guess_file_type(path: Path) -> str:

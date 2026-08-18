@@ -178,6 +178,54 @@ class CanvasPointEditingTests(unittest.TestCase):
         c.toggle_crosshair()
         self.assertTrue(c.is_crosshair_enabled())
 
+    # -- shared-vertex snapping / moving (Milestone 6) ----------------------
+
+    def test_new_point_snaps_onto_existing_vertex(self):
+        c = self._canvas()
+        c.set_snap_vertices([(7, 100.0, 0.0)])   # an existing vertex from another parcel
+        c.start_polygon()
+        c._place_point(QPointF(103.0, 2.0))       # within 8 px of vertex 7 -> snaps
+        self.assertEqual(c.polygon_points()[0], (100.0, 0.0))   # adopted exact coords
+        self.assertEqual(c.active_vertex_ids()[0], 7)           # reused the vertex id
+
+    def test_new_point_does_not_snap_onto_own_vertex(self):
+        c = self._canvas()
+        c.set_snap_vertices([(7, 100.0, 0.0)])
+        c.start_polygon()
+        c._place_point(QPointF(103.0, 2.0))       # snaps to vertex 7
+        c._place_point(QPointF(101.0, 1.0))       # near vertex 7 too, but it's now OWN
+        self.assertEqual(len(c.polygon_points()), 2)            # not merged
+        self.assertIsNone(c.active_vertex_ids()[1])             # a fresh (unshared) point
+
+    def test_moving_shared_vertex_emits_vertexMoved_and_updates_background(self):
+        c = self._canvas()
+        moved = []
+        c.vertexMoved.connect(lambda vid, x, y: moved.append((vid, x, y)))
+        changed = []
+        c.polygonChanged.connect(lambda: changed.append(True))
+        # Active parcel references shared vertex id 7; a background parcel also uses 7.
+        c.set_polygon([(100.0, 0.0), (200.0, 0.0), (150.0, 90.0)],
+                      closed=True, vertex_ids=[7, 8, 9])
+        c.set_background_polygons([
+            ([(100.0, 0.0), (0.0, 0.0), (0.0, 100.0)], [7, 10, 11], True, "#2D7DD2", "2"),
+        ])
+        c._set_marker_position("poly", 0, QPointF(100.0, -40.0))  # move the shared vertex
+        self.assertEqual(moved, [(7, 100.0, -40.0)])              # emitted, not polygonChanged
+        self.assertEqual(changed, [])
+        # The background parcel's copy of vertex 7 moved in lock-step.
+        bg = c._bg_polys[0]
+        self.assertEqual((bg["points"][0].x(), bg["points"][0].y()), (100.0, -40.0))
+
+    def test_moving_unshared_new_point_emits_polygonChanged(self):
+        c = self._canvas()
+        changed = []
+        c.polygonChanged.connect(lambda: changed.append(True))
+        c.start_polygon()
+        c._place_point(QPointF(10.0, 10.0))       # a new point, no vertex id
+        changed.clear()
+        c._set_marker_position("poly", 0, QPointF(20.0, 20.0))
+        self.assertEqual(changed, [True])         # structural change, not a shared move
+
 
 if __name__ == "__main__":
     unittest.main()

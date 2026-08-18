@@ -49,10 +49,20 @@ browser prototypes whose *logic* seeds this tool are kept under
   others show as context. Points, closed-state, and owner persist and restore
   per parcel. No structural schema change was needed (`parcels.source_id` already
   allows many); `owner` was added as an additive column (v4).
+- **Milestone 6 — topology-aware shared boundaries**: parcel boundaries are now
+  ordered references to **shared vertices** owned by the source (`vertices` +
+  `parcel_vertices`, replacing the per-parcel `points` table — schema v5, with a
+  rebuild-and-dedup migration). Tracing a point within `SNAP_TOLERANCE_PX` of an
+  existing vertex (of a *different* parcel) snaps onto it — a magenta ring warns
+  before it snaps, and a parcel never welds two of its *own* corners. Moving a
+  shared vertex (drag or arrow-nudge) moves it for **every** parcel referencing
+  it, so a shared edge is structurally identical, not just visually close. The
+  snap rule lives in `src/core/polygon.py` and is used by both the canvas and the
+  DB.
 
-Later milestones (unit profiles, identification templates, summary export, DXF)
-are scaffolded as docstring-only stubs under `src/` and will be filled in one
-milestone at a time.
+Later milestones (parcel multi-select, image preprocessing, unit profiles,
+identification templates, reports, DXF, location-fixing) are scaffolded or
+pending and will be filled in one milestone at a time.
 
 ### Run commands
 
@@ -87,7 +97,8 @@ src/
     project_db.py    SQLite schema + read/write for one project folder  (DONE)
     scale.py         two-point scale math (metres per pixel)            (DONE)
     geometry.py      segment / perimeter / shoelace-area (SI)           (DONE)
-    units.py polygon.py templates.py                                    (stubs)
+    polygon.py       shared-vertex snap rule + tolerance                (DONE)
+    units.py templates.py                                               (stubs)
   io/                pure-Python file loaders (no Qt)
     raster.py        neutral RasterImage type + open_raster dispatcher   (DONE)
     pdf_loader.py    PDF page -> RGBA raster via PyMuPDF                  (DONE)

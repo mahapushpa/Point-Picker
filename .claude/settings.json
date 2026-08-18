@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(PYTHONIOENCODING=utf-8 QT_QPA_PLATFORM=offscreen .venv/Scripts/python.exe -u \"C:/Users/Mahabir/AppData/Local/Temp/claude/e--1-geo-Development-Software-Point-Picker/c16527aa-814d-4e00-8e77-e04f3c874e7f/scratchpad/m6_smoke.py\")",
+      "Bash(git -c 'user.name=Point Picker Dev' -c user.email=technologies.maps@gmail.com commit -q -m 'Milestone 6: topology-aware shared parcel boundaries *)"
+    ]
+  }
+}
