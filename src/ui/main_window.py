@@ -26,8 +26,8 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QDockWidget, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
-    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+    QApplication, QComboBox, QDockWidget, QFileDialog, QHBoxLayout, QInputDialog,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
     QPushButton, QToolBar, QVBoxLayout, QWidget,
 )
 
@@ -35,9 +35,11 @@ from ..core.geometry import measure_polygon
 from ..core.project_db import ProjectDB, ProjectError
 from ..core.scale import compute_two_point_scale, TwoPointScale
 from ..core.selection import parcel_at_point, parcels_in_rect
+from ..core import units
 from ..io.raster import open_raster
 from ..io.preprocess import preprocess_raster
 from .canvas_view import CanvasView
+from .unit_profiles_dialog import UnitProfilesDialog
 
 #: Stable, visually-distinct colours assigned to parcels by their position, so
 #: several boundaries on one sheet don't get confused. Avoids the green used by
@@ -105,6 +107,7 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self._build_toolbar()
+        self._build_units_toolbar()
         self._build_parcel_dock()
 
     # -- construction -------------------------------------------------------
@@ -162,6 +165,27 @@ class MainWindow(QMainWindow):
             "being edited.")
         self._select_action.toggled.connect(self._on_select_toggled)
         bar.addAction(self._select_action)
+
+    def _build_units_toolbar(self) -> None:
+        """A visible 'Display units' row: pick the local area unit shown alongside
+        SI for the current source, and manage the saved profiles. On its own
+        toolbar so it's easy to find (units are a per-source display choice)."""
+        bar = QToolBar("Units", self)
+        bar.setMovable(False)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, bar)
+        bar.addWidget(QLabel(" Display units: "))
+        self._unit_combo = QComboBox()
+        self._unit_combo.setToolTip(
+            "Local area unit shown next to SI for this source's parcel areas. "
+            "SI (square metres) is always shown as the verifiable baseline.")
+        self._unit_combo.setMinimumWidth(180)
+        self._unit_combo.currentIndexChanged.connect(self._on_unit_selected)
+        bar.addWidget(self._unit_combo)
+        manage = QAction("Manage units…", self)
+        manage.setToolTip("Create, edit, or delete local area-unit profiles")
+        manage.triggered.connect(self.manage_unit_profiles)
+        bar.addAction(manage)
+        self._refresh_unit_combo()
 
     def _build_parcel_dock(self) -> None:
         """Sidebar listing the current source's parcels: select the active one,
@@ -262,6 +286,11 @@ class MainWindow(QMainWindow):
         clear_scale_act.triggered.connect(self.clear_scale)
         scale_menu.addAction(clear_scale_act)
 
+        units_menu = self.menuBar().addMenu("&Units")
+        manage_units_act = QAction("&Manage unit profiles…", self)
+        manage_units_act.triggered.connect(self.manage_unit_profiles)
+        units_menu.addAction(manage_units_act)
+
         select_menu = self.menuBar().addMenu("Se&lection")
         select_act = QAction("&Select parcels (click / marquee)", self)
         select_act.triggered.connect(self.begin_selection)
@@ -329,6 +358,7 @@ class MainWindow(QMainWindow):
         self._active_parcel_id = None
         self._selected_parcel_ids.clear()   # selection is a per-session working set
         self._project_readout.setText(f"Project: {proj.get_meta('project_name')}")
+        self._refresh_unit_combo()   # profiles are project-level
         self._update_title()
 
     def _attach_source_to_project(self) -> None:
@@ -365,6 +395,7 @@ class MainWindow(QMainWindow):
         self._parcels = parcels
         active = parcels[0]["id"] if parcels else None
         self._reload_parcels(select_id=active)
+        self._refresh_unit_combo()   # enable + reflect this source's active unit
         self._update_scale_readout()
 
     # -- parcels ------------------------------------------------------------
@@ -855,6 +886,54 @@ class MainWindow(QMainWindow):
         self._project.move_vertex(vertex_id, x, y, metres_per_pixel=self._mpp())
         self._update_measure_readout()
 
+    # -- unit profiles (Milestone 9) ----------------------------------------
+
+    def _refresh_unit_combo(self) -> None:
+        """Rebuild the display-units combo from the project's profiles and select
+        the current source's active one (or 'SI only'). Disabled with no source."""
+        combo = self._unit_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("SI only (square metre)", None)   # userData None = no profile
+        profiles = self._project.list_unit_profiles() if self._project is not None else []
+        for prof in profiles:
+            combo.addItem(f"{prof['name']}  (1 = {prof['sq_m_per_unit']:g} m²)", prof["id"])
+        active = (self._project.get_source_unit_profile(self._source_id)
+                  if self._project is not None and self._source_id is not None else None)
+        target_id = active["id"] if active else None
+        idx = combo.findData(target_id)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+        combo.setEnabled(self._project is not None and self._source_id is not None)
+
+    def _on_unit_selected(self, _index: int) -> None:
+        """Persist the chosen display unit for the current source and refresh the
+        live measurement so SI + the new unit show side by side."""
+        if self._project is None or self._source_id is None:
+            return
+        profile_id = self._unit_combo.currentData()
+        self._project.set_source_unit_profile(self._source_id, profile_id)
+        self._update_measure_readout()
+
+    def manage_unit_profiles(self) -> None:
+        """Open the create/edit/delete dialog for local unit profiles."""
+        if self._project is None:
+            QMessageBox.information(
+                self, "No project",
+                "Open or create a project first — unit profiles are saved per project.")
+            return
+        dlg = UnitProfilesDialog(self._project, self)
+        dlg.exec()
+        # A profile may have been added/renamed/deleted (deleting the active one
+        # clears it on the source), so rebuild the combo and re-measure.
+        self._refresh_unit_combo()
+        self._update_measure_readout()
+
+    def _active_unit_profile(self) -> dict | None:
+        if self._project is None or self._source_id is None:
+            return None
+        return self._project.get_source_unit_profile(self._source_id)
+
     # -- readouts -----------------------------------------------------------
 
     def _update_scale_readout(self) -> None:
@@ -874,9 +953,18 @@ class MainWindow(QMainWindow):
         m = measure_polygon(pts, mpp, closed=self.canvas.is_polygon_closed())
         n = m.point_count
         if m.has_scale:
-            seg = f"{m.last_segment_m:.3g} m" if m.last_segment_m is not None else "—"
-            perim = f"{m.perimeter_m:.4g} m"
-            area = f"{m.area_sq_m:.4g} m²" if n >= 3 else "—"
+            seg = f"{_fmt(m.last_segment_m)} m" if m.last_segment_m is not None else "—"
+            perim = f"{_fmt(m.perimeter_m)} m"
+            if n >= 3:
+                # SI is always the baseline (Scale-first rule); a selected local
+                # profile is shown alongside it, not instead of it. The profile is
+                # areal, so only area gets the second unit — length stays SI.
+                area = f"{_fmt(m.area_sq_m)} m²"
+                prof = self._active_unit_profile()
+                if prof is not None and prof["name"] != units.SI_AREA_UNIT:
+                    area += f" = {_fmt(units.area_in_unit(m.area_sq_m, prof['sq_m_per_unit']))} {prof['name']}"
+            else:
+                area = "—"
             self._measure_readout.setText(
                 f"Pts {n} | last seg {seg} | perim {perim} | area {area}")
         else:
@@ -901,6 +989,17 @@ class MainWindow(QMainWindow):
             self._project.close()
             self._project = None
         super().closeEvent(event)
+
+
+def _fmt(value: float) -> str:
+    """Format a measurement value with ~4 significant figures, but without
+    scientific notation for readable magnitudes (so an SI baseline like 10000 m²
+    reads as '10000', not '1e+04'). Large numbers become plain integers; small
+    ones keep their significant digits."""
+    formatted = f"{value:.4g}"
+    if "e" not in formatted and "E" not in formatted:
+        return formatted
+    return f"{value:.2f}".rstrip("0").rstrip(".")
 
 
 def _scale_from_db_row(row: dict) -> TwoPointScale:

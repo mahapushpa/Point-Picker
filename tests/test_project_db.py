@@ -567,5 +567,112 @@ class ProjectDBTests(unittest.TestCase):
             self.assertEqual(p2.get_parcel(pid)["owner"], "Ramesh")
 
 
+class UnitProfileTests(unittest.TestCase):
+    """Milestone 9: user-defined unit profiles and per-source active selection."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="lmt_units_"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _source_id(self, p):
+        sample = self.tmp / "sheet.png"
+        if not sample.exists():
+            sample.write_bytes(b"x")
+        return p.import_source(sample, "image")
+
+    def test_create_and_list_user_profile(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            pid = p.create_unit_profile("Bigha — Jaipur", 2529.28)
+            got = p.get_unit_profile(pid)
+            self.assertEqual(got["name"], "Bigha — Jaipur")
+            self.assertAlmostEqual(got["sq_m_per_unit"], 2529.28)
+            self.assertFalse(got["is_builtin"])
+            # Listed after the four built-ins.
+            names = [u["name"] for u in p.list_unit_profiles()]
+            self.assertEqual(names[:4], ["square metre", "square foot", "acre", "hectare"])
+            self.assertIn("Bigha — Jaipur", names)
+
+    def test_create_rejects_duplicate_and_bad_factor(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            p.create_unit_profile("Bigha", 2500.0)
+            with self.assertRaises(ProjectError):
+                p.create_unit_profile("Bigha", 2600.0)          # duplicate name
+            with self.assertRaises(ProjectError):
+                p.create_unit_profile("Zero", 0.0)              # non-positive
+            with self.assertRaises(ProjectError):
+                p.create_unit_profile("   ", 100.0)             # empty name
+
+    def test_update_user_profile_round_trip(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            pid = p.create_unit_profile("Bigha", 2500.0)
+            p.update_unit_profile(pid, name="Bigha — Jaipur", sq_m_per_unit=2529.28)
+            got = p.get_unit_profile(pid)
+            self.assertEqual(got["name"], "Bigha — Jaipur")
+            self.assertAlmostEqual(got["sq_m_per_unit"], 2529.28)
+
+    def test_builtins_cannot_be_edited_or_deleted(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            acre = next(u for u in p.list_unit_profiles() if u["name"] == "acre")
+            with self.assertRaises(ProjectError):
+                p.update_unit_profile(acre["id"], sq_m_per_unit=1.0)
+            with self.assertRaises(ProjectError):
+                p.delete_unit_profile(acre["id"])
+
+    def test_delete_user_profile(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            pid = p.create_unit_profile("Bigha", 2500.0)
+            p.delete_unit_profile(pid)
+            self.assertIsNone(p.get_unit_profile(pid))
+
+    def test_source_active_profile_round_trip(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            self.assertIsNone(p.get_source_unit_profile(sid))   # none by default
+            pid = p.create_unit_profile("Bigha", 2529.28)
+            p.set_source_unit_profile(sid, pid)
+            active = p.get_source_unit_profile(sid)
+            self.assertEqual(active["id"], pid)
+            self.assertAlmostEqual(active["sq_m_per_unit"], 2529.28)
+            p.set_source_unit_profile(sid, None)                # clear
+            self.assertIsNone(p.get_source_unit_profile(sid))
+
+    def test_deleting_active_profile_clears_it_on_source(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            pid = p.create_unit_profile("Bigha", 2529.28)
+            p.set_source_unit_profile(sid, pid)
+            p.delete_unit_profile(pid)                          # active one deleted
+            self.assertIsNone(p.get_source_unit_profile(sid))  # reference cleared, no dangling
+
+    def test_active_profile_persists_across_reopen(self):
+        root = self.tmp / "proj"
+        with ProjectDB.create(root) as p:
+            sid = self._source_id(p)
+            pid = p.create_unit_profile("Bigha — Jaipur", 2529.28)
+            p.set_source_unit_profile(sid, pid)
+        with ProjectDB.open(root) as p2:
+            active = p2.get_source_unit_profile(sid)
+            self.assertEqual(active["name"], "Bigha — Jaipur")
+
+    def test_upgrade_from_v5_adds_unit_profile_column(self):
+        """A v5 project (no sources.unit_profile_id) upgrades additively so the
+        active-profile selection can be stored."""
+        root = self.tmp / "legacy5"
+        with ProjectDB.create(root) as p:
+            sid = self._source_id(p)
+        conn = sqlite3.connect(str(root / "project.db"))
+        conn.execute("ALTER TABLE sources DROP COLUMN unit_profile_id")
+        conn.execute("PRAGMA user_version = 5")
+        conn.commit()
+        conn.close()
+        with ProjectDB.open(root) as p2:
+            self.assertEqual(p2.schema_version, SCHEMA_VERSION)
+            pid = p2.create_unit_profile("Bigha", 2500.0)
+            p2.set_source_unit_profile(sid, pid)               # column exists again
+            self.assertEqual(p2.get_source_unit_profile(sid)["id"], pid)
+
+
 if __name__ == "__main__":
     unittest.main()

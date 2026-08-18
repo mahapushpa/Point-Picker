@@ -9,7 +9,7 @@ See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) for the full specification. The prior
 browser prototypes whose *logic* seeds this tool are kept under
 [reference/](reference/) for reference only.
 
-## Status — Milestones 1–8 complete
+## Status — Milestones 1–9 complete
 
 - **Milestone 1 — portable project store**: create/open a project folder
   (`project.db` + `sources/` + `exports/`); its SQLite schema works identically
@@ -88,9 +88,22 @@ browser prototypes whose *logic* seeds this tool are kept under
   processing is pure Python (Pillow + numpy) in `src/io/preprocess.py`; the raw
   raster and the source file on disk are never modified.
 
-Later milestones (unit profiles, identification templates, reports, DXF,
-location-fixing) are scaffolded or pending and will be filled in one milestone
-at a time.
+- **Milestone 9 — unit profiles**: parcel areas display in **SI plus an optional
+  local unit, side by side** (never one replacing the other — SI stays the
+  verifiable baseline per the Scale-first rule). Four **built-in** area units
+  (square metre, square foot, acre, hectare) ship as fixed, exact conversions in
+  `src/core/units.py`; **user-defined local profiles** (`{name, square metres per
+  unit}`, e.g. "Bigha — Jaipur") are created/edited/deleted from a **Manage
+  units…** dialog and saved in the project. The active unit is chosen from a
+  **Display units** toolbar combo and is **per source** (different sheets/regions
+  can use different local units), stored as an additive `sources.unit_profile_id`
+  column (schema v6). Canonical storage stays SI — profiles are a display/export
+  conversion only, never how geometry is stored; a local profile converts *area*
+  only, so perimeter and segment lengths stay SI. With no profile selected the
+  readout falls back to SI alone.
+
+Later milestones (identification templates, reports, DXF, location-fixing) are
+scaffolded or pending and will be filled in one milestone at a time.
 
 ### Run commands
 
@@ -127,7 +140,8 @@ src/
     geometry.py      segment / perimeter / shoelace-area (SI)           (DONE)
     polygon.py       shared-vertex snap rule + tolerance                (DONE)
     selection.py     parcel hit-testing (click + marquee) for M7        (DONE)
-    units.py templates.py                                               (stubs)
+    units.py         built-in + local area-unit conversions (SI-canon)  (DONE)
+    templates.py                                                        (stub)
   io/                pure-Python file loaders (no Qt)
     raster.py        neutral RasterImage type + open_raster dispatcher   (DONE)
     preprocess.py    denoise (median) + contrast (CLAHE), value-only     (DONE)

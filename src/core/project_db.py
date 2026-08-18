@@ -29,6 +29,7 @@ from pathlib import Path, PurePosixPath
 import shutil
 
 from .polygon import nearest_vertex_index, SNAP_TOLERANCE_PX
+from .units import BUILTIN_AREA_UNITS
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -44,8 +45,10 @@ from .polygon import nearest_vertex_index, SNAP_TOLERANCE_PX
 #: source needed no schema change (parcels.source_id already allows many rows).
 #: v5 is a *restructuring* (not additive): the per-parcel ``points`` table is
 #: replaced by shared ``vertices`` + ``parcel_vertices``, with a dedicated
-#: rebuild migration (see ``_migrate_points_to_vertices``).
-SCHEMA_VERSION = 5
+#: rebuild migration (see ``_migrate_points_to_vertices``). v6 (Milestone 9)
+#: adds ``sources.unit_profile_id`` — the local area-unit profile selected for
+#: display on that source — a purely additive nullable column.
+SCHEMA_VERSION = 6
 
 DB_FILENAME = "project.db"
 SOURCES_DIRNAME = "sources"
@@ -80,7 +83,9 @@ CREATE TABLE IF NOT EXISTS sources (
 
 -- Local area-unit profiles. SI is canonical; every profile is just a factor to
 -- square metres. sq m / sq ft / acre / hectare are seeded as built-ins; Bigha,
--- Biswa and any regional measure are user-added (Milestone 5).
+-- Biswa and any regional measure are user-added (Milestone 9). Which profile is
+-- active for a given source is recorded in sources.unit_profile_id (an additive
+-- column); it is a display/export choice only and never affects stored geometry.
 CREATE TABLE IF NOT EXISTS unit_profiles (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     name          TEXT    NOT NULL UNIQUE,
@@ -163,12 +168,9 @@ CREATE TABLE IF NOT EXISTS source_scales (
 """
 
 #: Seeded on project creation. Universally correct, region-neutral units only.
-BUILTIN_UNIT_PROFILES = (
-    ("square metre", 1.0),
-    ("square foot", 0.09290304),
-    ("acre", 4046.8564224),
-    ("hectare", 10000.0),
-)
+#: Single source of truth for the factors is ``core.units`` so the DB seed and
+#: the conversion logic can never drift apart.
+BUILTIN_UNIT_PROFILES = tuple(BUILTIN_AREA_UNITS.items())
 
 #: Columns added to existing tables after their first release. Applied
 #: additively via guarded ``ALTER TABLE ADD COLUMN`` (CREATE TABLE IF NOT EXISTS
@@ -178,6 +180,10 @@ BUILTIN_UNIT_PROFILES = (
 _ADDITIVE_COLUMNS = (
     ("parcels", "closed", "INTEGER NOT NULL DEFAULT 0"),
     ("parcels", "owner", "TEXT"),
+    # v6: the local area-unit profile chosen for display on a source. Plain
+    # INTEGER (no DB-level FK, since ALTER ADD COLUMN can't carry ON DELETE);
+    # delete_unit_profile() clears any references in application code.
+    ("sources", "unit_profile_id", "INTEGER"),
 )
 
 #: Sentinel for "argument not supplied" in partial updates (distinct from None,
@@ -249,12 +255,7 @@ class ProjectDB:
                 "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
                 list(meta.items()),
             )
-            for uname, factor in BUILTIN_UNIT_PROFILES:
-                conn.execute(
-                    "INSERT OR IGNORE INTO unit_profiles "
-                    "(name, sq_m_per_unit, is_builtin, created_at) VALUES (?, ?, 1, ?)",
-                    (uname, factor, now),
-                )
+            _seed_builtin_units(conn)
             conn.commit()
         except Exception:
             conn.close()
@@ -286,7 +287,8 @@ class ProjectDB:
             )
         if found < SCHEMA_VERSION:
             conn.executescript(SCHEMA_SQL)   # new tables (source_scales, vertices, parcel_vertices)
-            _ensure_additive_columns(conn)   # new columns (parcels.closed / owner)
+            _ensure_additive_columns(conn)   # new columns (parcels.closed / owner, sources.unit_profile_id)
+            _seed_builtin_units(conn)        # ensure built-in units exist post-upgrade
             if _table_exists(conn, "points"):
                 # v5 restructuring: rebuild per-parcel points as shared vertices,
                 # then drop the old table. Safe as a clean rebuild since only
@@ -469,6 +471,111 @@ class ProjectDB:
         """Remove any stored scale for a source (used when re-calibrating)."""
         self.conn.execute("DELETE FROM source_scales WHERE source_id = ?", (source_id,))
         self.conn.commit()
+
+    # -- unit profiles (Milestone 9) ----------------------------------------
+    #
+    # SI is canonical; a profile is only a factor to square metres, applied at
+    # display/export time and never to stored geometry. Built-ins (sq m / sq ft /
+    # acre / hectare) are fixed and cannot be edited or deleted; local measures
+    # (Bigha, ...) are user-added. Which profile is active is per-source
+    # (``sources.unit_profile_id``), so different sheets can use different local
+    # units. "No profile" is a valid state — the UI still shows SI.
+
+    def list_unit_profiles(self) -> list[dict]:
+        """All unit profiles, built-ins first (in their seed order) then
+        user-defined by name. Each: id, name, sq_m_per_unit, is_builtin."""
+        rows = self.conn.execute(
+            "SELECT id, name, sq_m_per_unit, is_builtin FROM unit_profiles "
+            "ORDER BY is_builtin DESC, "
+            # built-ins keep their canonical order; user ones sort by name
+            "CASE WHEN is_builtin = 1 THEN id ELSE 0 END, name COLLATE NOCASE"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_unit_profile(self, profile_id: int) -> dict | None:
+        row = self.conn.execute(
+            "SELECT id, name, sq_m_per_unit, is_builtin FROM unit_profiles WHERE id = ?",
+            (profile_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def create_unit_profile(self, name: str, sq_m_per_unit: float) -> int:
+        """Add a user-defined local area unit (factor to square metres). Names are
+        unique (case-sensitively, as stored); raises on a duplicate name or a
+        non-positive factor."""
+        name = (name or "").strip()
+        if not name:
+            raise ProjectError("Unit profile name must not be empty.")
+        if not (sq_m_per_unit > 0):
+            raise ProjectError(f"Conversion factor must be positive, got {sq_m_per_unit!r}.")
+        try:
+            cur = self.conn.execute(
+                "INSERT INTO unit_profiles (name, sq_m_per_unit, is_builtin, created_at) "
+                "VALUES (?, ?, 0, ?)",
+                (name, float(sq_m_per_unit), _utcnow()),
+            )
+        except sqlite3.IntegrityError:
+            raise ProjectError(f"A unit profile named {name!r} already exists.")
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def update_unit_profile(self, profile_id: int, *, name: str | None = None,
+                            sq_m_per_unit: float | None = None) -> None:
+        """Rename and/or re-factor a user-defined profile. Built-ins are fixed and
+        cannot be changed."""
+        existing = self.get_unit_profile(profile_id)
+        if existing is None:
+            raise ProjectError(f"No unit profile with id {profile_id}.")
+        if existing["is_builtin"]:
+            raise ProjectError(f"The built-in unit {existing['name']!r} cannot be edited.")
+        new_name = existing["name"] if name is None else (name or "").strip()
+        if not new_name:
+            raise ProjectError("Unit profile name must not be empty.")
+        new_factor = existing["sq_m_per_unit"] if sq_m_per_unit is None else float(sq_m_per_unit)
+        if not (new_factor > 0):
+            raise ProjectError(f"Conversion factor must be positive, got {new_factor!r}.")
+        try:
+            self.conn.execute(
+                "UPDATE unit_profiles SET name = ?, sq_m_per_unit = ? WHERE id = ?",
+                (new_name, new_factor, profile_id),
+            )
+        except sqlite3.IntegrityError:
+            raise ProjectError(f"A unit profile named {new_name!r} already exists.")
+        self.conn.commit()
+
+    def delete_unit_profile(self, profile_id: int) -> None:
+        """Delete a user-defined profile and clear it from any source that had it
+        active. Built-ins cannot be deleted."""
+        existing = self.get_unit_profile(profile_id)
+        if existing is None:
+            raise ProjectError(f"No unit profile with id {profile_id}.")
+        if existing["is_builtin"]:
+            raise ProjectError(f"The built-in unit {existing['name']!r} cannot be deleted.")
+        # No DB-level FK on sources.unit_profile_id, so clear references here.
+        self.conn.execute(
+            "UPDATE sources SET unit_profile_id = NULL WHERE unit_profile_id = ?", (profile_id,))
+        self.conn.execute("DELETE FROM unit_profiles WHERE id = ?", (profile_id,))
+        self.conn.commit()
+
+    def set_source_unit_profile(self, source_id: int, profile_id: int | None) -> None:
+        """Set (or clear, with None) the active display unit profile for a source."""
+        if self.conn.execute("SELECT 1 FROM sources WHERE id = ?", (source_id,)).fetchone() is None:
+            raise ProjectError(f"No source with id {source_id} in this project.")
+        if profile_id is not None and self.get_unit_profile(profile_id) is None:
+            raise ProjectError(f"No unit profile with id {profile_id}.")
+        self.conn.execute(
+            "UPDATE sources SET unit_profile_id = ? WHERE id = ?", (profile_id, source_id))
+        self.conn.commit()
+
+    def get_source_unit_profile(self, source_id: int) -> dict | None:
+        """The active unit profile for a source as a dict, or None if unset (or
+        the source is unknown)."""
+        row = self.conn.execute(
+            "SELECT p.id, p.name, p.sq_m_per_unit, p.is_builtin "
+            "FROM sources s JOIN unit_profiles p ON p.id = s.unit_profile_id "
+            "WHERE s.id = ?", (source_id,),
+        ).fetchone()
+        return dict(row) if row else None
 
     # -- parcels & shared vertices (Milestone 6) ----------------------------
     #
@@ -736,6 +843,18 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     return conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", (name,)
     ).fetchone() is not None
+
+
+def _seed_builtin_units(conn: sqlite3.Connection) -> None:
+    """Insert the fixed built-in area units if absent. Idempotent (``INSERT OR
+    IGNORE`` on the UNIQUE name), so it is safe on both create and upgrade."""
+    now = _utcnow()
+    for uname, factor in BUILTIN_UNIT_PROFILES:
+        conn.execute(
+            "INSERT OR IGNORE INTO unit_profiles "
+            "(name, sq_m_per_unit, is_builtin, created_at) VALUES (?, ?, 1, ?)",
+            (uname, factor, now),
+        )
 
 
 def _migrate_points_to_vertices(conn: sqlite3.Connection) -> None:
