@@ -9,7 +9,7 @@ See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) for the full specification. The prior
 browser prototypes whose *logic* seeds this tool are kept under
 [reference/](reference/) for reference only.
 
-## Status — Milestones 1–3 complete
+## Status — Milestones 1–4 complete
 
 - **Milestone 1 — portable project store**: create/open a project folder
   (`project.db` + `sources/` + `exports/`); its SQLite schema works identically
@@ -21,14 +21,20 @@ browser prototypes whose *logic* seeds this tool are kept under
 - **Milestone 3 — manual two-point scale (SI only)**: click "Set scale", click
   two points a known distance apart, enter the real-world distance in metres,
   and the tool derives and displays metres-per-pixel. Redo any time. The scale
-  math is pure Python (`src/core/scale.py`); persistence lives in `project_db`
-  (per-source, SI-canonical) with round-trip tests. The GUI holds the scale in
-  memory for now — wiring the GUI to a project comes with project-aware tracing
-  (Milestone 4).
+  math is pure Python (`src/core/scale.py`).
+- **Milestone 4 — project-aware polygon tracing + measurement**: File > New/Open
+  Project registers the loaded file into the project's `sources/` (copied,
+  referenced by relative path) and persists the scale and traced boundary to
+  `project.db`; reopening restores them. "Trace" places a sequence of boundary
+  points forming a closed polygon (orange, distinct from the green scale
+  markers), with live segment / perimeter / area readout, plus undo / close /
+  clear. Geometry is pure Python (`src/core/geometry.py`), SI only. Tracing
+  works **without** a scale too — the readout shows pixel units with a "(no
+  scale)" indicator and switches to metres the moment a scale is set.
 
-Later milestones (polygon tracing, unit profiles, identification templates,
-summary export, DXF) are scaffolded as docstring-only stubs under `src/` and
-will be filled in one milestone at a time.
+Later milestones (unit profiles, identification templates, summary export, DXF)
+are scaffolded as docstring-only stubs under `src/` and will be filled in one
+milestone at a time.
 
 ### Run commands
 
@@ -62,7 +68,8 @@ src/
   core/              pure Python domain logic
     project_db.py    SQLite schema + read/write for one project folder  (DONE)
     scale.py         two-point scale math (metres per pixel)            (DONE)
-    units.py geometry.py polygon.py templates.py                        (stubs)
+    geometry.py      segment / perimeter / shoelace-area (SI)           (DONE)
+    units.py polygon.py templates.py                                    (stubs)
   io/                pure-Python file loaders (no Qt)
     raster.py        neutral RasterImage type + open_raster dispatcher   (DONE)
     pdf_loader.py    PDF page -> RGBA raster via PyMuPDF                  (DONE)

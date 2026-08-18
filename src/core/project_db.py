@@ -347,6 +347,33 @@ class ProjectDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_source_by_relative_path(self, relative_path: str) -> dict | None:
+        rel = PurePosixPath(relative_path).as_posix()
+        row = self.conn.execute(
+            "SELECT id, relative_path, file_type, original_name, page, doc_date, added_at "
+            "FROM sources WHERE relative_path = ?", (rel,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def import_or_get_source(self, src_file, file_type: str | None = None,
+                            *, doc_date: str | None = None,
+                            page: int | None = None) -> tuple[int, bool]:
+        """Register *src_file* into the project, or return the existing row if a
+        source with the same relative path (``sources/<name>``) is already
+        registered. Returns ``(source_id, already_existed)``. Idempotent so a
+        file can be re-opened / re-attached without duplicating or re-copying.
+        """
+        src_file = Path(src_file)
+        rel = PurePosixPath(SOURCES_DIRNAME) / src_file.name
+        existing = self.get_source_by_relative_path(str(rel))
+        if existing is not None:
+            # If the copy is missing (e.g. sources/ was cleared), restore it.
+            dest = self.resolve(existing["relative_path"])
+            if not dest.exists() and src_file.is_file():
+                shutil.copy2(src_file, dest)
+            return existing["id"], True
+        return self.import_source(src_file, file_type, doc_date=doc_date, page=page), False
+
     # -- source scale (Milestone 3) -----------------------------------------
 
     def set_source_scale(self, source_id: int, metres_per_pixel: float, *,
@@ -386,6 +413,81 @@ class ProjectDB:
         """Remove any stored scale for a source (used when re-calibrating)."""
         self.conn.execute("DELETE FROM source_scales WHERE source_id = ?", (source_id,))
         self.conn.commit()
+
+    # -- parcels & polygon points (Milestone 4) -----------------------------
+    #
+    # Milestone 4 keeps one parcel (one traced boundary) per source. The parcel
+    # is created lazily the first time a polygon is saved. Points are stored in
+    # boundary order; pixel coordinates are canonical, and local_x/local_y are
+    # populated in SI when a scale is available so the DB always carries the
+    # metric coordinates too (refreshed whenever the polygon or scale changes).
+
+    def get_parcel_for_source(self, source_id: int) -> dict | None:
+        row = self.conn.execute(
+            "SELECT id, name, source_id, scale_m_per_px, notes, created_at, updated_at "
+            "FROM parcels WHERE source_id = ? ORDER BY id LIMIT 1", (source_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_or_create_parcel_for_source(self, source_id: int, name: str | None = None) -> int:
+        existing = self.get_parcel_for_source(source_id)
+        if existing is not None:
+            return existing["id"]
+        if self.conn.execute("SELECT 1 FROM sources WHERE id = ?", (source_id,)).fetchone() is None:
+            raise ProjectError(f"No source with id {source_id} in this project.")
+        now = _utcnow()
+        cur = self.conn.execute(
+            "INSERT INTO parcels (name, source_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (name, source_id, now, now),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def save_polygon(self, source_id: int, pixel_points: list[tuple[float, float]],
+                    *, metres_per_pixel: float | None = None,
+                    name: str | None = None) -> int:
+        """Replace the traced boundary for *source_id* with *pixel_points* (in
+        order). Returns the parcel id. Local (SI) coordinates are stored when a
+        scale is given. Passing an empty list clears the boundary but keeps the
+        parcel row."""
+        parcel_id = self.get_or_create_parcel_for_source(source_id, name=name)
+        self.conn.execute("DELETE FROM points WHERE parcel_id = ?", (parcel_id,))
+        for i, (px, py) in enumerate(pixel_points):
+            lx = ly = None
+            if metres_per_pixel is not None:
+                lx, ly = px * metres_per_pixel, py * metres_per_pixel
+            self.conn.execute(
+                "INSERT INTO points (parcel_id, seq, label, pixel_x, pixel_y, local_x, local_y) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (parcel_id, i, str(i + 1), float(px), float(py), lx, ly),
+            )
+        self.conn.execute("UPDATE parcels SET updated_at = ? WHERE id = ?", (_utcnow(), parcel_id))
+        self.conn.commit()
+        return parcel_id
+
+    def get_parcel_points(self, parcel_id: int) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT seq, label, pixel_x, pixel_y, local_x, local_y, lat, lon "
+            "FROM points WHERE parcel_id = ? ORDER BY seq", (parcel_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_polygon(self, source_id: int) -> list[tuple[float, float]]:
+        """Return the source's boundary as ordered (pixel_x, pixel_y) tuples,
+        or an empty list if none is stored."""
+        parcel = self.get_parcel_for_source(source_id)
+        if parcel is None:
+            return []
+        return [(p["pixel_x"], p["pixel_y"]) for p in self.get_parcel_points(parcel["id"])]
+
+    def clear_polygon(self, source_id: int) -> None:
+        """Delete the stored boundary points for a source's parcel (if any)."""
+        parcel = self.get_parcel_for_source(source_id)
+        if parcel is not None:
+            self.conn.execute("DELETE FROM points WHERE parcel_id = ?", (parcel["id"],))
+            self.conn.execute("UPDATE parcels SET updated_at = ? WHERE id = ?",
+                              (_utcnow(), parcel["id"]))
+            self.conn.commit()
 
     # -- unit profiles ------------------------------------------------------
 

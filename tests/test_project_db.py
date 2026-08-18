@@ -223,6 +223,83 @@ class ProjectDBTests(unittest.TestCase):
             p2.set_source_scale(sid, 0.5)
             self.assertAlmostEqual(p2.get_source_scale(sid)["metres_per_pixel"], 0.5)
 
+    # -- idempotent source registration (Milestone 4) -----------------------
+
+    def test_import_or_get_source_is_idempotent(self):
+        sample = self.tmp / "sheet.png"
+        sample.write_bytes(b"img")
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid1, existed1 = p.import_or_get_source(sample, "image")
+            self.assertFalse(existed1)
+            sid2, existed2 = p.import_or_get_source(sample, "image")
+            self.assertTrue(existed2)
+            self.assertEqual(sid1, sid2)
+            self.assertEqual(len(p.list_sources()), 1)
+
+    # -- polygon persistence (Milestone 4) ----------------------------------
+
+    def test_save_and_read_polygon(self):
+        pts = [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)]
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            p.save_polygon(sid, pts, metres_per_pixel=0.5)
+            got = p.get_polygon(sid)
+            self.assertEqual(got, pts)  # order preserved
+            parcel = p.get_parcel_for_source(sid)
+            stored = p.get_parcel_points(parcel["id"])
+            self.assertEqual(len(stored), 4)
+            self.assertEqual([s["seq"] for s in stored], [0, 1, 2, 3])
+            # local (SI) coords populated from the scale: 100 px * 0.5 = 50 m
+            self.assertAlmostEqual(stored[1]["local_x"], 50.0)
+            self.assertAlmostEqual(stored[2]["local_y"], 25.0)
+
+    def test_save_polygon_without_scale_leaves_local_null(self):
+        pts = [(0.0, 0.0), (10.0, 0.0), (5.0, 8.0)]
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            p.save_polygon(sid, pts)
+            parcel = p.get_parcel_for_source(sid)
+            stored = p.get_parcel_points(parcel["id"])
+            self.assertTrue(all(s["local_x"] is None and s["local_y"] is None for s in stored))
+
+    def test_save_polygon_replaces_previous(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            p.save_polygon(sid, [(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)])
+            p.save_polygon(sid, [(0.0, 0.0), (5.0, 0.0)])  # re-trace
+            self.assertEqual(p.get_polygon(sid), [(0.0, 0.0), (5.0, 0.0)])
+
+    def test_polygon_persists_across_reopen(self):
+        root = self.tmp / "proj"
+        pts = [(1.0, 2.0), (3.0, 4.0), (5.0, 1.0)]
+        with ProjectDB.create(root) as p:
+            sid = self._source_id(p)
+            p.save_polygon(sid, pts, metres_per_pixel=0.1)
+        with ProjectDB.open(root) as p2:
+            self.assertEqual(p2.get_polygon(sid), pts)
+
+    def test_clear_polygon_keeps_parcel(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            p.save_polygon(sid, [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)])
+            pid = p.get_parcel_for_source(sid)["id"]
+            p.clear_polygon(sid)
+            self.assertEqual(p.get_polygon(sid), [])
+            self.assertIsNotNone(p.get_parcel_for_source(sid))  # parcel row remains
+            self.assertEqual(p.get_parcel_points(pid), [])
+
+    def test_one_parcel_per_source(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            id1 = p.get_or_create_parcel_for_source(sid)
+            id2 = p.get_or_create_parcel_for_source(sid)
+            self.assertEqual(id1, id2)
+
+    def test_get_polygon_empty_when_none(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            self.assertEqual(p.get_polygon(sid), [])
+
 
 if __name__ == "__main__":
     unittest.main()

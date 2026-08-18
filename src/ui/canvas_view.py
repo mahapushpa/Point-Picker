@@ -21,7 +21,7 @@ Milestone 4.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal
-from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor
+from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QBrush
 from PySide6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsEllipseItem, QGraphicsLineItem,
     QGraphicsSimpleTextItem, QGraphicsItem,
@@ -29,7 +29,8 @@ from PySide6.QtWidgets import (
 
 from ..io.raster import RasterImage
 
-_MARK_COLOR = QColor("#1D9E75")  # same accent green as point_picker.html
+_MARK_COLOR = QColor("#1D9E75")  # scale-calibration markers: accent green (as point_picker.html)
+_POLY_COLOR = QColor("#E8770F")  # boundary-tracing markers: orange, visually distinct
 
 
 def qimage_from_raster(raster: RasterImage) -> QImage:
@@ -58,6 +59,10 @@ class CanvasView(QGraphicsView):
 
     #: Emitted (in image pixel coordinates) once two calibration points are set.
     twoPointsPicked = Signal(QPointF, QPointF)
+    #: Emitted whenever the traced polygon changes (add / undo / clear / close).
+    polygonChanged = Signal()
+    #: Emitted when the polygon is closed (>= 3 points).
+    polygonClosed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -77,6 +82,12 @@ class CanvasView(QGraphicsView):
         self._calib_points: list[QPointF] = []
         self._calib_items: list[QGraphicsItem] = []
 
+        # Polygon-tracing state.
+        self._tracing = False
+        self._poly_points: list[QPointF] = []
+        self._poly_closed = False
+        self._poly_items: list[QGraphicsItem] = []
+
         # Zoom around the cursor (the prototype's zoom-to-cursor math).
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
@@ -91,10 +102,14 @@ class CanvasView(QGraphicsView):
     def set_image(self, raster: RasterImage) -> None:
         """Display *raster*, replacing anything already shown, and fit it."""
         pixmap = QPixmap.fromImage(qimage_from_raster(raster))
-        self._scene.clear()  # also drops any calibration marker items
+        self._scene.clear()  # also drops any calibration / polygon marker items
         self._calib_points.clear()
         self._calib_items.clear()
         self._calibrating = False
+        self._poly_points.clear()
+        self._poly_items.clear()
+        self._poly_closed = False
+        self._tracing = False
         self._pixmap_item = self._scene.addPixmap(pixmap)
         self._scene.setSceneRect(QRectF(pixmap.rect()))
         self.reset_view()
@@ -124,6 +139,7 @@ class CanvasView(QGraphicsView):
         two clicks. Returns False if there is no image to calibrate against."""
         if self._pixmap_item is None:
             return False
+        self._tracing = False  # modes are mutually exclusive
         self.clear_scale_markers()
         self._calibrating = True
         self._update_cursor()
@@ -144,6 +160,74 @@ class CanvasView(QGraphicsView):
 
     def is_calibrating(self) -> bool:
         return self._calibrating
+
+    # -- polygon tracing ----------------------------------------------------
+
+    def start_polygon(self) -> bool:
+        """Enter boundary-tracing mode. Returns False if there is no image.
+        Keeps any existing polygon so tracing can be resumed; use
+        :meth:`clear_polygon` to start over."""
+        if self._pixmap_item is None:
+            return False
+        self._calibrating = False  # modes are mutually exclusive
+        if self._poly_closed:
+            # Re-opening a closed polygon to continue editing.
+            self._poly_closed = False
+        self._tracing = True
+        self._update_cursor()
+        return True
+
+    def stop_polygon(self) -> None:
+        """Leave tracing mode without altering the polygon."""
+        self._tracing = False
+        self._update_cursor()
+
+    def undo_last_point(self) -> None:
+        if not self._poly_points:
+            return
+        self._poly_points.pop()
+        self._poly_closed = False
+        self._redraw_polygon()
+        self.polygonChanged.emit()
+
+    def clear_polygon(self) -> None:
+        had_any = bool(self._poly_points)
+        self._poly_points.clear()
+        self._poly_closed = False
+        self._redraw_polygon()
+        if had_any:
+            self.polygonChanged.emit()
+
+    def close_polygon(self) -> bool:
+        """Close the boundary (last point joins the first). Needs >= 3 points."""
+        if len(self._poly_points) < 3 or self._poly_closed:
+            return False
+        self._poly_closed = True
+        self._tracing = False
+        self._redraw_polygon()
+        self._update_cursor()
+        self.polygonChanged.emit()
+        self.polygonClosed.emit()
+        return True
+
+    def set_polygon(self, pixel_points, closed: bool = True) -> None:
+        """Replace the polygon with points restored from storage (image pixels).
+        Does not emit change signals — the caller is loading, not editing."""
+        self._poly_points = [QPointF(float(x), float(y)) for x, y in pixel_points]
+        self._poly_closed = closed and len(self._poly_points) >= 3
+        self._tracing = False
+        self._redraw_polygon()
+        self._update_cursor()
+
+    def polygon_points(self) -> list[tuple[float, float]]:
+        """Current boundary as ordered (x, y) image-pixel tuples."""
+        return [(p.x(), p.y()) for p in self._poly_points]
+
+    def is_polygon_closed(self) -> bool:
+        return self._poly_closed
+
+    def is_tracing(self) -> bool:
+        return self._tracing
 
     # -- interaction --------------------------------------------------------
 
@@ -215,17 +299,22 @@ class CanvasView(QGraphicsView):
     # -- click-to-mark ------------------------------------------------------
 
     def _handle_click(self, view_pos: QPointF) -> None:
-        """A genuine click (no drag). Only meaningful while calibrating."""
-        if not self._calibrating or self._pixmap_item is None:
+        """A genuine click (no drag). Meaningful while calibrating or tracing."""
+        if self._pixmap_item is None:
             return
         scene_pt = self.mapToScene(view_pos.toPoint())  # == image pixel coords
-        self._calib_points.append(scene_pt)
-        self._add_calib_marker(scene_pt, len(self._calib_points))
-        if len(self._calib_points) == 2:
-            self._add_calib_line(self._calib_points[0], self._calib_points[1])
-            self._calibrating = False
-            self._update_cursor()
-            self.twoPointsPicked.emit(self._calib_points[0], self._calib_points[1])
+        if self._calibrating:
+            self._calib_points.append(scene_pt)
+            self._add_calib_marker(scene_pt, len(self._calib_points))
+            if len(self._calib_points) == 2:
+                self._add_calib_line(self._calib_points[0], self._calib_points[1])
+                self._calibrating = False
+                self._update_cursor()
+                self.twoPointsPicked.emit(self._calib_points[0], self._calib_points[1])
+        elif self._tracing:
+            self._poly_points.append(scene_pt)
+            self._redraw_polygon()
+            self.polygonChanged.emit()
 
     def _add_calib_marker(self, scene_pt: QPointF, number: int) -> None:
         r = 6.0
@@ -257,12 +346,68 @@ class CanvasView(QGraphicsView):
         self._scene.addItem(line)
         self._calib_items.append(line)
 
+    # -- polygon drawing ----------------------------------------------------
+
+    def _redraw_polygon(self) -> None:
+        """Rebuild all boundary items from the current point list. Cheap for the
+        handful of vertices a parcel has, and avoids fragile incremental
+        bookkeeping across add / undo / clear / close."""
+        for item in self._poly_items:
+            if item.scene() is self._scene:
+                self._scene.removeItem(item)
+        self._poly_items.clear()
+
+        pts = self._poly_points
+        edge = QPen(_POLY_COLOR)
+        edge.setWidth(2)
+        edge.setCosmetic(True)  # constant on-screen width at any zoom
+        # Edges between consecutive vertices.
+        for a, b in zip(pts, pts[1:]):
+            line = QGraphicsLineItem(a.x(), a.y(), b.x(), b.y())
+            line.setPen(edge)
+            self._scene.addItem(line)
+            self._poly_items.append(line)
+        # Closing edge (drawn dashed) when the polygon is closed.
+        if self._poly_closed and len(pts) >= 3:
+            closing = QPen(_POLY_COLOR)
+            closing.setWidth(2)
+            closing.setCosmetic(True)
+            closing.setStyle(Qt.PenStyle.DashLine)
+            line = QGraphicsLineItem(pts[-1].x(), pts[-1].y(), pts[0].x(), pts[0].y())
+            line.setPen(closing)
+            self._scene.addItem(line)
+            self._poly_items.append(line)
+        # Vertices on top, at constant on-screen size.
+        for i, p in enumerate(pts, start=1):
+            self._add_poly_vertex(p, i)
+
+    def _add_poly_vertex(self, scene_pt: QPointF, number: int) -> None:
+        r = 5.0
+        pen = QPen(_POLY_COLOR)
+        pen.setWidth(2)
+        pen.setCosmetic(True)
+        dot = QGraphicsEllipseItem(-r, -r, 2 * r, 2 * r)
+        dot.setPen(pen)
+        dot.setBrush(QBrush(_POLY_COLOR))  # filled: distinct from hollow calib dots
+        dot.setPos(scene_pt)
+        dot.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        self._scene.addItem(dot)
+        self._poly_items.append(dot)
+
+        label = QGraphicsSimpleTextItem(str(number))
+        label.setBrush(_POLY_COLOR)
+        label.setPos(scene_pt)
+        label.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        label.moveBy(r + 2, -(r + 12))
+        self._scene.addItem(label)
+        self._poly_items.append(label)
+
     # -- helpers ------------------------------------------------------------
 
     def _update_cursor(self) -> None:
         if self._pixmap_item is None:
             self.unsetCursor()
-        elif self._calibrating:
+        elif self._calibrating or self._tracing:
             self.setCursor(Qt.CursorShape.CrossCursor)
         else:
             self.setCursor(Qt.CursorShape.OpenHandCursor)
