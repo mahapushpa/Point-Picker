@@ -151,10 +151,17 @@ class MainWindow(QMainWindow):
             bar.addAction(act)
 
         bar.addSeparator()
-        select_act = QAction("Select", self)
-        select_act.setToolTip("Select parcels: click a parcel to toggle it, drag a marquee for several")
-        select_act.triggered.connect(self.begin_selection)
-        bar.addAction(select_act)
+        # A checkable, clearly-labelled toggle so Select mode stands out from the
+        # one-shot Scale/Trace actions and visibly latches while it is active —
+        # the M7 mechanism was correct but users couldn't find how to enter it.
+        self._select_action = QAction("Select parcels", self)
+        self._select_action.setCheckable(True)
+        self._select_action.setToolTip(
+            "Select parcels (toggle): click a parcel to add/remove it, drag a "
+            "marquee to select several. A working set, separate from the parcel "
+            "being edited.")
+        self._select_action.toggled.connect(self._on_select_toggled)
+        bar.addAction(self._select_action)
 
     def _build_parcel_dock(self) -> None:
         """Sidebar listing the current source's parcels: select the active one,
@@ -504,15 +511,37 @@ class MainWindow(QMainWindow):
     # -- parcel selection (Milestone 7) -------------------------------------
 
     def begin_selection(self) -> None:
-        """Enter canvas selection mode: click a parcel to toggle it, drag a marquee
-        to catch several. Distinct from the active (editable) parcel."""
-        if not self.canvas.start_selection():
-            QMessageBox.information(self, "No document", "Open a PDF or image first.")
-            return
-        self._sync_crosshair_action()
-        self._status.setText(
-            "Select parcels: click a parcel to toggle it; drag a marquee to select "
-            "several. This working subset is separate from the active parcel.")
+        """Enter parcel selection mode (menu / programmatic entry point). Latches
+        the checkable toolbar toggle, which drives :meth:`_on_select_toggled`."""
+        if self._select_action.isChecked():
+            self._on_select_toggled(True)   # already on: (re)affirm the mode + hint
+        else:
+            self._select_action.setChecked(True)  # emits toggled -> _on_select_toggled
+
+    def _on_select_toggled(self, checked: bool) -> None:
+        """The Select toolbar toggle changed. On: enter canvas selection mode and
+        explain it in the status bar. Off: leave selection mode (the selection
+        set itself is kept)."""
+        if checked:
+            if not self.canvas.start_selection():
+                self._set_select_checked(False)
+                QMessageBox.information(self, "No document", "Open a PDF or image first.")
+                return
+            self._sync_crosshair_action()
+            self._status.setText(
+                "Select mode: click a parcel to toggle it, drag to select several. "
+                "(This working set is separate from the parcel being edited.)")
+        else:
+            if self.canvas.is_selecting():
+                self.canvas.stop_selection()
+            self._status.setText("Select mode off.")
+
+    def _set_select_checked(self, on: bool) -> None:
+        """Set the Select toggle's visual state without re-running its handler
+        (used when another mode takes over, or to revert a failed entry)."""
+        self._select_action.blockSignals(True)
+        self._select_action.setChecked(on)
+        self._select_action.blockSignals(False)
 
     def selected_parcel_ids(self) -> list[int]:
         """The current selection working subset, in parcel (display) order. This
@@ -621,7 +650,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Could not open file", f"{Path(path).name}\n\n{exc}")
             self._status.setText("Open a PDF or image to begin.")
             return
-        self.canvas.set_image(raster)   # clears any prior markers/boundary
+        self.canvas.set_image(raster)   # clears any prior markers/boundary + exits selection mode
+        self._set_select_checked(False)
         self._raw_raster = raster
         self._pre_raster = None         # invalidate any cached enhancement
         self._current_path = str(path)
@@ -681,6 +711,7 @@ class MainWindow(QMainWindow):
         if not self.canvas.start_scale_calibration():
             QMessageBox.information(self, "No document", "Open a PDF or image first.")
             return
+        self._set_select_checked(False)   # canvas already left selection mode
         self._sync_crosshair_action()
         self._status.setText(
             "Set scale: click two points a known distance apart; drag or arrow-keys "
@@ -725,6 +756,7 @@ class MainWindow(QMainWindow):
         if not self.canvas.start_polygon():
             QMessageBox.information(self, "No document", "Open a PDF or image first.")
             return
+        self._set_select_checked(False)   # canvas already left selection mode
         self._sync_crosshair_action()
         hint = ("Trace boundary: click to add points; drag or arrow-keys to fine-tune; "
                 "Enter (or 'Close') to finish, Esc to cancel.")

@@ -162,6 +162,36 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(self.w._active_parcel_id, self.pa)
         self.assertEqual(self.w.selected_parcel_ids(), [self.pb])
 
+    # -- select mode discoverability + toggle -------------------------------
+
+    def test_select_toolbar_action_is_checkable_with_clear_label(self):
+        act = self.w._select_action
+        self.assertTrue(act.isCheckable())               # a visible latch, not a one-shot
+        self.assertIn("select", act.text().lower())      # label names the action
+        self.assertIn("parcel", act.text().lower())
+        self.assertTrue(act.toolTip())                   # explains click + marquee
+
+    def test_begin_selection_latches_toggle_and_enters_mode(self):
+        self.assertFalse(self.w._select_action.isChecked())
+        self.w.begin_selection()
+        self.assertTrue(self.w._select_action.isChecked())
+        self.assertTrue(self.w.canvas.is_selecting())
+        self.assertIn("select mode", self.w._status.text().lower())  # hint shown in the UI
+
+    def test_toggling_off_exits_mode_but_keeps_selection(self):
+        self.w.begin_selection()
+        self.w.toggle_parcel_selection(self.pa)          # pick one while in mode
+        self.w._select_action.setChecked(False)          # user clicks the toggle off
+        self.assertFalse(self.w.canvas.is_selecting())
+        self.assertEqual(self.w.selected_parcel_ids(), [self.pa])  # selection persists
+
+    def test_switching_to_trace_unchecks_select_toggle(self):
+        self.w.begin_selection()
+        self.assertTrue(self.w._select_action.isChecked())
+        self.w.begin_polygon_tracing()
+        self.assertFalse(self.w._select_action.isChecked())
+        self.assertFalse(self.w.canvas.is_selecting())
+
     # -- lifecycle ----------------------------------------------------------
 
     def test_deleting_selected_parcel_prunes_it(self):

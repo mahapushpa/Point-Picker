@@ -60,9 +60,11 @@ browser prototypes whose *logic* seeds this tool are kept under
   snap rule lives in `src/core/polygon.py` and is used by both the canvas and the
   DB.
 - **Milestone 7 — parcel selection (multi-select)**: a **working subset** of
-  parcels, kept strictly separate from the single active/editable parcel. In the
-  new **Select** canvas mode, click a parcel (its fill or boundary) to toggle it,
-  or drag a **marquee** to catch every parcel touching or within it (additive).
+  parcels, kept strictly separate from the single active/editable parcel. A
+  checkable **Select parcels** toolbar toggle (and a **Selection** menu) enters
+  the mode and visibly latches while it's active, with a status-bar hint
+  explaining the gesture; click a parcel (its fill or boundary) to toggle it, or
+  drag a **marquee** to catch every parcel touching or within it (additive).
   Three on-canvas states are now visually distinct: active-for-editing (thick
   outline + vertex dots), selected-but-not-active (translucent fill + heavier
   outline), and unselected context (thin muted outline). The **Parcels** sidebar
@@ -176,6 +178,14 @@ A project folder is self-contained: moving, backing up, or copying it to a pen
 drive is just copying the folder. Source documents stay as files under
 `sources/` and are referenced by relative path from `project.db` — never
 embedded as database blobs.
+
+**Source-file immutability (non-negotiable):** once a file is copied into
+`sources/` it is the canonical original and is never overwritten in place by
+anything the app does — not the M8 preprocessing preview (kept in memory only),
+nor any future derived artifact (which must be a distinctly-named new file). The
+only writes into `sources/` are create-only copies, and the rule is guarded by a
+test ([tests/test_source_immutability.py](tests/test_source_immutability.py))
+that checksums the imported file across an open → enhance → trace → save flow.
 
 ## Tests
 

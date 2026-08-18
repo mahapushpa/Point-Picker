@@ -67,6 +67,14 @@ their *logic* carries forward into this tool, not the files themselves (see
 - One project = one folder = one `.db` file + a `sources/` subfolder + any
   exported summaries. Moving, backing up, or copying to a pen drive is just
   copying that folder.
+- **Source files are never modified in place (non-negotiable).** Once a
+  file is copied into `sources/` on import, that copy is never overwritten
+  by anything the app does — not preprocessing, not a future auto-trace
+  cache, not any derived artifact. Any processed/derived version of a
+  source must be saved as a distinctly-named new file (a clear suffix,
+  e.g. `sheet_enhanced.png` next to `sheet.png`) or kept in memory only
+  (as M8's preprocessing preview already does), never as a same-name
+  overwrite. It must always be unambiguous which file is the original.
 
 ## Land identification & revenue-record fields
 These aren't computed — they're metadata the user attaches to a traced

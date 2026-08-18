@@ -339,6 +339,18 @@ class ProjectDB:
         return self.conn.execute("PRAGMA user_version").fetchone()[0]
 
     # -- sources ------------------------------------------------------------
+    #
+    # SOURCE-FILE IMMUTABILITY (non-negotiable, PROJECT_BRIEF "Offline & storage
+    # constraints"): once a file is copied into ``sources/`` it is the canonical
+    # original and MUST NEVER be overwritten in place by anything the app does —
+    # not preprocessing, not an auto-trace cache, not any derived artifact. The
+    # only writes into ``sources/`` are the create-only copies below, each
+    # guarded so it can only ever create a new file, never replace an existing
+    # one. Any *derived* version of a source (e.g. an enhanced scan) must be a
+    # distinctly-named new file (``sheet_enhanced.png`` beside ``sheet.png``) or
+    # kept in memory only — as M8's preprocessing preview does — so it is always
+    # unambiguous which file is the untouched original. Future milestones that
+    # touch source files must preserve this invariant.
 
     def import_source(self, src_file, file_type: str | None = None,
                       *, doc_date: str | None = None, page: int | None = None) -> int:
@@ -346,7 +358,8 @@ class ProjectDB:
 
         Returns the new source id. The file is copied (kept as a file, never a
         blob) and only its project-relative path is stored, so the project
-        stays portable.
+        stays portable. Create-only: if a same-named file already exists in
+        ``sources/`` this raises rather than overwriting it (immutability rule).
         """
         src_file = Path(src_file)
         if not src_file.is_file():
@@ -409,6 +422,8 @@ class ProjectDB:
         existing = self.get_source_by_relative_path(str(rel))
         if existing is not None:
             # If the copy is missing (e.g. sources/ was cleared), restore it.
+            # Create-only: guarded by ``not dest.exists()`` so an existing
+            # original is never overwritten (source-file immutability rule).
             dest = self.resolve(existing["relative_path"])
             if not dest.exists() and src_file.is_file():
                 shutil.copy2(src_file, dest)
