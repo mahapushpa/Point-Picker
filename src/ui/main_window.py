@@ -24,10 +24,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QInputDialog, QLabel, QMainWindow, QMessageBox,
-    QToolBar,
+    QApplication, QDockWidget, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+    QPushButton, QToolBar, QVBoxLayout, QWidget,
 )
 
 from ..core.geometry import measure_polygon
@@ -35,6 +36,18 @@ from ..core.project_db import ProjectDB, ProjectError
 from ..core.scale import compute_two_point_scale, TwoPointScale
 from ..io.raster import open_raster
 from .canvas_view import CanvasView
+
+#: Stable, visually-distinct colours assigned to parcels by their position, so
+#: several boundaries on one sheet don't get confused. Avoids the green used by
+#: scale-calibration markers.
+_PARCEL_PALETTE = (
+    "#E8770F", "#2D7DD2", "#8E44AD", "#16A085",
+    "#C0392B", "#B8860B", "#D6336C", "#4B6584",
+)
+
+
+def _parcel_color(index: int) -> QColor:
+    return QColor(_PARCEL_PALETTE[index % len(_PARCEL_PALETTE)])
 
 _FILE_FILTER = (
     "Supported documents (*.pdf *.png *.jpg *.jpeg *.bmp *.tif *.tiff);;"
@@ -61,6 +74,8 @@ class MainWindow(QMainWindow):
         self._current_path: str | None = None
         self._source_id: int | None = None
         self._scale: TwoPointScale | None = None  # in-memory; mirrors the DB when a project is open
+        self._parcels: list[dict] = []            # parcels of the current source (project mode)
+        self._active_parcel_id: int | None = None
 
         # Status bar: transient message on the left; permanent readouts right.
         self._status = QLabel("Open a PDF or image to begin.")
@@ -73,6 +88,7 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self._build_toolbar()
+        self._build_parcel_dock()
 
     # -- construction -------------------------------------------------------
 
@@ -109,6 +125,40 @@ class MainWindow(QMainWindow):
             act.setToolTip(tooltip)
             act.triggered.connect(slot)
             bar.addAction(act)
+
+    def _build_parcel_dock(self) -> None:
+        """Sidebar listing the current source's parcels: select the active one,
+        add/delete, and edit its owner. Only meaningful with a project open."""
+        dock = QDockWidget("Parcels", self)
+        dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea |
+                             Qt.DockWidgetArea.RightDockWidgetArea)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        self._parcel_list = QListWidget()
+        self._parcel_list.currentRowChanged.connect(self._on_parcel_row_changed)
+        layout.addWidget(self._parcel_list, 1)
+
+        buttons = QHBoxLayout()
+        self._new_parcel_btn = QPushButton("New parcel")
+        self._new_parcel_btn.clicked.connect(self.new_parcel)
+        self._del_parcel_btn = QPushButton("Delete")
+        self._del_parcel_btn.clicked.connect(self.delete_active_parcel)
+        buttons.addWidget(self._new_parcel_btn)
+        buttons.addWidget(self._del_parcel_btn)
+        layout.addLayout(buttons)
+
+        layout.addWidget(QLabel("Owner:"))
+        self._owner_edit = QLineEdit()
+        self._owner_edit.setPlaceholderText("owner name")
+        self._owner_edit.editingFinished.connect(self._on_owner_edited)
+        layout.addWidget(self._owner_edit)
+
+        dock.setWidget(body)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self._parcel_dock = dock
+        self._refresh_parcel_controls_enabled()
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
@@ -204,14 +254,17 @@ class MainWindow(QMainWindow):
             self._project.close()
         self._project = proj
         self._source_id = None
+        self._parcels = []
+        self._active_parcel_id = None
         self._project_readout.setText(f"Project: {proj.get_meta('project_name')}")
         self._update_title()
 
     def _attach_source_to_project(self) -> None:
-        """Register the loaded file into the open project (idempotent), then
-        either restore its saved scale/boundary or push the current in-memory
-        ones into the freshly registered source."""
+        """Register the loaded file into the open project (idempotent), restore
+        its saved scale, and load its parcels — or, for a source not seen before,
+        push the current in-memory scale/boundary in as its first parcel."""
         if self._project is None or self._current_path is None:
+            self._reload_parcels()
             return
         try:
             sid, _existed = self._project.import_or_get_source(self._current_path)
@@ -226,16 +279,153 @@ class MainWindow(QMainWindow):
         elif self._scale is not None:
             self._persist_scale()                       # push in-memory scale
 
-        db_poly = self._project.get_polygon(sid)
-        if db_poly:
-            # Restore the exact saved open/closed state, not one inferred from
-            # the point count — an open 3+-point boundary stays open.
-            self.canvas.set_polygon(db_poly, closed=self._project.get_polygon_closed(sid))
-        elif self.canvas.polygon_points():
-            self._persist_polygon()                     # push in-memory boundary
+        parcels = self._project.list_parcels(sid)
+        if not parcels and self.canvas.polygon_points():
+            # First time this file is added and something is already traced:
+            # keep that work as parcel 1.
+            pid = self._project.create_parcel(sid)
+            self._project.save_parcel_polygon(
+                pid, self.canvas.polygon_points(),
+                closed=self.canvas.is_polygon_closed(),
+                metres_per_pixel=self._mpp())
+            parcels = self._project.list_parcels(sid)
 
+        self._parcels = parcels
+        active = parcels[0]["id"] if parcels else None
+        self._reload_parcels(select_id=active)
         self._update_scale_readout()
+
+    # -- parcels ------------------------------------------------------------
+
+    def _reload_parcels(self, select_id: int | None = None) -> None:
+        """Refresh the parcel list from the DB and set the active parcel (loading
+        its boundary into the canvas and the others into the background)."""
+        if self._project is not None and self._source_id is not None:
+            self._parcels = self._project.list_parcels(self._source_id)
+        else:
+            self._parcels = []
+        self._rebuild_parcel_list()
+
+        if select_id is None:
+            select_id = self._active_parcel_id
+        ids = [p["id"] for p in self._parcels]
+        if select_id not in ids:
+            select_id = ids[0] if ids else None
+        self._set_active_parcel(select_id)
+        self._refresh_parcel_controls_enabled()
+
+    def _rebuild_parcel_list(self) -> None:
+        self._parcel_list.blockSignals(True)
+        self._parcel_list.clear()
+        for i, p in enumerate(self._parcels):
+            item = QListWidgetItem(self._parcel_label(i, p))
+            item.setForeground(_parcel_color(i))  # colour matches the on-canvas boundary
+            item.setData(Qt.ItemDataRole.UserRole, p["id"])
+            self._parcel_list.addItem(item)
+        self._parcel_list.blockSignals(False)
+
+    def _parcel_label(self, index: int, parcel: dict) -> str:
+        owner = parcel.get("owner") or "(no owner)"
+        n = parcel.get("point_count", 0)
+        mark = " ✓" if parcel.get("closed") else ""
+        return f"{index + 1}. {owner} — {n} pt{'s' if n != 1 else ''}{mark}"
+
+    def _set_active_parcel(self, parcel_id: int | None) -> None:
+        self._active_parcel_id = parcel_id
+        if parcel_id is None:
+            self.canvas.set_polygon([], closed=False)
+            self.canvas.set_background_polygons([])
+            self._owner_edit.blockSignals(True)
+            self._owner_edit.setText("")
+            self._owner_edit.blockSignals(False)
+            self._update_measure_readout()
+            return
+
+        index = self._parcel_index(parcel_id)
+        self.canvas.set_active_color(_parcel_color(index if index is not None else 0))
+        pts = self._project.get_parcel_polygon(parcel_id)
+        self.canvas.set_polygon(pts, closed=self._project.get_parcel_closed(parcel_id))
+        self._refresh_backgrounds()
+
+        parcel = self._parcels[index] if index is not None else self._project.get_parcel(parcel_id)
+        self._owner_edit.blockSignals(True)
+        self._owner_edit.setText((parcel.get("owner") or "") if parcel else "")
+        self._owner_edit.blockSignals(False)
+
+        # Keep the list selection in sync (e.g. when set programmatically).
+        if index is not None and self._parcel_list.currentRow() != index:
+            self._parcel_list.blockSignals(True)
+            self._parcel_list.setCurrentRow(index)
+            self._parcel_list.blockSignals(False)
         self._update_measure_readout()
+
+    def _refresh_backgrounds(self) -> None:
+        """Draw every parcel except the active one as a context overlay."""
+        polys = []
+        for i, p in enumerate(self._parcels):
+            if p["id"] == self._active_parcel_id:
+                continue
+            pts = self._project.get_parcel_polygon(p["id"])
+            polys.append((pts, bool(p["closed"]), _parcel_color(i), f"{i + 1}"))
+        self.canvas.set_background_polygons(polys)
+
+    def new_parcel(self) -> None:
+        if self._project is None or self._source_id is None:
+            QMessageBox.information(
+                self, "No project",
+                "Open or create a project first — parcels are saved per project.")
+            return
+        pid = self._project.create_parcel(self._source_id, owner=self._owner_edit.text().strip() or None)
+        self._reload_parcels(select_id=pid)
+        self.begin_polygon_tracing()  # ready to trace the new parcel immediately
+        self._status.setText(f"New parcel {len(self._parcels)} — click to trace its boundary.")
+
+    def delete_active_parcel(self) -> None:
+        if self._project is None or self._active_parcel_id is None:
+            return
+        index = self._parcel_index(self._active_parcel_id)
+        label = self._parcel_label(index or 0, self._parcels[index]) if index is not None else "this parcel"
+        if QMessageBox.question(self, "Delete parcel", f"Delete {label}?") != QMessageBox.StandardButton.Yes:
+            return
+        self._project.delete_parcel(self._active_parcel_id)
+        self._active_parcel_id = None
+        self._reload_parcels()
+        self._status.setText("Parcel deleted.")
+
+    def _on_parcel_row_changed(self, row: int) -> None:
+        if row < 0 or row >= len(self._parcels):
+            return
+        self._set_active_parcel(self._parcels[row]["id"])
+
+    def _on_owner_edited(self) -> None:
+        if self._project is None or self._active_parcel_id is None:
+            return
+        owner = self._owner_edit.text().strip() or None
+        self._project.update_parcel(self._active_parcel_id, owner=owner)
+        index = self._parcel_index(self._active_parcel_id)
+        if index is not None:
+            self._parcels[index]["owner"] = owner
+            self._update_parcel_list_row(index)
+
+    def _refresh_parcel_controls_enabled(self) -> None:
+        has_project = self._project is not None and self._source_id is not None
+        self._new_parcel_btn.setEnabled(has_project)
+        self._del_parcel_btn.setEnabled(has_project and self._active_parcel_id is not None)
+        self._owner_edit.setEnabled(has_project and self._active_parcel_id is not None)
+
+    def _parcel_index(self, parcel_id: int | None) -> int | None:
+        for i, p in enumerate(self._parcels):
+            if p["id"] == parcel_id:
+                return i
+        return None
+
+    def _update_parcel_list_row(self, index: int) -> None:
+        item = self._parcel_list.item(index)
+        if item is not None:
+            item.setText(self._parcel_label(index, self._parcels[index]))
+
+    def _mpp(self) -> float | None:
+        return self._scale.metres_per_pixel if self._scale is not None else None
 
     # -- files --------------------------------------------------------------
 
@@ -256,7 +446,9 @@ class MainWindow(QMainWindow):
         self.canvas.set_image(raster)   # clears any prior markers/boundary
         self._current_path = str(path)
         self._source_id = None
-        self._scale = None              # a new file has its own scale/boundary
+        self._scale = None              # a new file has its own scale/boundaries
+        self._parcels = []
+        self._active_parcel_id = None
         self._attach_source_to_project()
         self._update_scale_readout()
         self._update_measure_readout()
@@ -279,7 +471,7 @@ class MainWindow(QMainWindow):
         self._scale = None
         if self._project is not None and self._source_id is not None:
             self._project.clear_source_scale(self._source_id)
-            self._persist_polygon()  # boundary local coords no longer have a scale
+            self._refresh_all_parcels_si()  # parcels' local coords no longer have a scale
         self._update_scale_readout()
         self._update_measure_readout()
         self._status.setText("Scale cleared.")
@@ -354,19 +546,53 @@ class MainWindow(QMainWindow):
             self._source_id, s.metres_per_pixel, method=s.method,
             p1=s.p1, p2=s.p2, real_distance_m=s.real_distance_m,
         )
-        self._persist_polygon()  # refresh boundary's SI coordinates with new scale
+        self._refresh_all_parcels_si()  # every parcel's SI coords use the source scale
+
+    def _refresh_all_parcels_si(self) -> None:
+        """Re-store every parcel's boundary so its SI (local_x/local_y) columns
+        reflect the current source scale. Points are unchanged."""
+        if self._project is None or self._source_id is None:
+            return
+        mpp = self._mpp()
+        for p in self._project.list_parcels(self._source_id):
+            pts = self._project.get_parcel_polygon(p["id"])
+            self._project.save_parcel_polygon(p["id"], pts, closed=bool(p["closed"]),
+                                              metres_per_pixel=mpp)
 
     def _persist_polygon(self) -> None:
+        """Persist the active boundary to its parcel. If tracing began before a
+        parcel existed, lazily create one — without disturbing the in-progress
+        canvas state (so tracing continues uninterrupted)."""
         if self._project is None or self._source_id is None:
             return
         pts = self.canvas.polygon_points()
-        mpp = self._scale.metres_per_pixel if self._scale is not None else None
-        if pts:
-            self._project.save_polygon(self._source_id, pts,
-                                       closed=self.canvas.is_polygon_closed(),
-                                       metres_per_pixel=mpp)
-        else:
-            self._project.clear_polygon(self._source_id)
+        closed = self.canvas.is_polygon_closed()
+        mpp = self._mpp()
+
+        if self._active_parcel_id is None:
+            if not pts:
+                return
+            self._active_parcel_id = self._project.create_parcel(self._source_id)
+            self._project.save_parcel_polygon(self._active_parcel_id, pts,
+                                              closed=closed, metres_per_pixel=mpp)
+            self._parcels = self._project.list_parcels(self._source_id)
+            self._rebuild_parcel_list()
+            index = self._parcel_index(self._active_parcel_id)
+            if index is not None:
+                self._parcel_list.blockSignals(True)
+                self._parcel_list.setCurrentRow(index)
+                self._parcel_list.blockSignals(False)
+                self.canvas.set_active_color(_parcel_color(index))
+            self._refresh_parcel_controls_enabled()
+            return
+
+        self._project.save_parcel_polygon(self._active_parcel_id, pts,
+                                          closed=closed, metres_per_pixel=mpp)
+        index = self._parcel_index(self._active_parcel_id)
+        if index is not None:
+            self._parcels[index]["point_count"] = len(pts)
+            self._parcels[index]["closed"] = 1 if closed else 0
+            self._update_parcel_list_row(index)
 
     # -- readouts -----------------------------------------------------------
 

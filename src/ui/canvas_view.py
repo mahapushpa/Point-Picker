@@ -97,11 +97,14 @@ class CanvasView(QGraphicsView):
         self._calib_points: list[QPointF] = []
         self._calib_items: list[QGraphicsItem] = []
 
-        # Polygon-tracing state.
+        # Polygon-tracing state (the one active, editable boundary).
         self._tracing = False
         self._poly_points: list[QPointF] = []
         self._poly_closed = False
         self._poly_items: list[QGraphicsItem] = []
+        self._active_color = _POLY_COLOR
+        # Other parcels of the same source, drawn for context (not editable).
+        self._bg_items: list[QGraphicsItem] = []
 
         # Precision crosshair.
         self._crosshair_enabled = False
@@ -126,6 +129,7 @@ class CanvasView(QGraphicsView):
         self._scene.clear()  # also drops any calibration / polygon marker items
         self._reset_calibration_state()
         self._reset_polygon_state()
+        self._bg_items.clear()  # scene.clear() already removed them
         self._active = None
         self._drag_kind = self._drag_index = None
         self._pixmap_item = self._scene.addPixmap(pixmap)
@@ -256,6 +260,45 @@ class CanvasView(QGraphicsView):
 
     def is_tracing(self) -> bool:
         return self._tracing
+
+    def set_active_color(self, color: QColor) -> None:
+        """Colour of the active (editable) boundary. Set per parcel so each is
+        visually distinct from the others shown in the background."""
+        self._active_color = QColor(color)
+        self._redraw_polygon()
+
+    def set_background_polygons(self, polygons) -> None:
+        """Draw other parcels of the same source for context, non-interactively.
+        *polygons* is a list of ``(points, closed, color, label)`` where points
+        are (x, y) image-pixel tuples. These are visuals only — hit-testing and
+        editing always target the single active boundary."""
+        self._remove_items(self._bg_items)
+        for points, closed, color, label in polygons:
+            if not points:
+                continue
+            qcolor = QColor(color)
+            qcolor.setAlpha(210)  # slightly muted so the active boundary stands out
+            pen = QPen(qcolor)
+            pen.setWidth(2)
+            pen.setCosmetic(True)
+            qpts = [QPointF(float(x), float(y)) for x, y in points]
+            segments = list(zip(qpts, qpts[1:]))
+            if closed and len(qpts) >= 3:
+                segments.append((qpts[-1], qpts[0]))
+            for a, b in segments:
+                line = QGraphicsLineItem(a.x(), a.y(), b.x(), b.y())
+                line.setPen(pen)
+                line.setZValue(1)  # above the pixmap, below the active boundary
+                self._scene.addItem(line)
+                self._bg_items.append(line)
+            if label:
+                text = QGraphicsSimpleTextItem(label)
+                text.setBrush(QColor(color))
+                text.setPos(qpts[0])
+                text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+                text.setZValue(2)
+                self._scene.addItem(text)
+                self._bg_items.append(text)
 
     # -- shared pick: confirm / cancel / crosshair --------------------------
 
@@ -502,26 +545,29 @@ class CanvasView(QGraphicsView):
     def _redraw_polygon(self) -> None:
         self._remove_items(self._poly_items)
         pts = self._poly_points
-        edge = QPen(_POLY_COLOR)
-        edge.setWidth(2)
+        color = self._active_color
+        edge = QPen(color)
+        edge.setWidth(3)          # the active boundary is drawn a touch thicker
         edge.setCosmetic(True)
         for a, b in zip(pts, pts[1:]):
             line = QGraphicsLineItem(a.x(), a.y(), b.x(), b.y())
             line.setPen(edge)
+            line.setZValue(5)
             self._scene.addItem(line)
             self._poly_items.append(line)
         if self._poly_closed and len(pts) >= 3:
-            closing = QPen(_POLY_COLOR)
-            closing.setWidth(2)
+            closing = QPen(color)
+            closing.setWidth(3)
             closing.setCosmetic(True)
             closing.setStyle(Qt.PenStyle.DashLine)
             line = QGraphicsLineItem(pts[-1].x(), pts[-1].y(), pts[0].x(), pts[0].y())
             line.setPen(closing)
+            line.setZValue(5)
             self._scene.addItem(line)
             self._poly_items.append(line)
         for i, p in enumerate(pts):
             active = self._active == ("poly", i)
-            self._add_marker(self._poly_items, p, str(i + 1), _POLY_COLOR,
+            self._add_marker(self._poly_items, p, str(i + 1), color,
                              filled=True, active=active)
 
     def _redraw_active(self) -> None:

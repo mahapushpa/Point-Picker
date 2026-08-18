@@ -38,8 +38,9 @@ import shutil
 #: guarded ``ALTER TABLE ADD COLUMN``, see ``_ADDITIVE_COLUMNS``) — so opening
 #: an older file just applies the missing pieces and updates the version, with
 #: no data migration and no breaking change. v2 added ``source_scales``;
-#: v3 added ``parcels.closed``.
-SCHEMA_VERSION = 3
+#: v3 added ``parcels.closed``; v4 added ``parcels.owner``. Multiple parcels per
+#: source needed no schema change (parcels.source_id already allows many rows).
+SCHEMA_VERSION = 4
 
 DB_FILENAME = "project.db"
 SOURCES_DIRNAME = "sources"
@@ -95,6 +96,7 @@ CREATE TABLE IF NOT EXISTS parcels (
     unit_profile_id INTEGER REFERENCES unit_profiles(id) ON DELETE SET NULL,
     notes           TEXT,                                 -- always-present free text
     closed          INTEGER NOT NULL DEFAULT 0,           -- 1 if the boundary is closed
+    owner           TEXT,                                 -- parcel owner (links parcels for reports)
     created_at      TEXT    NOT NULL,
     updated_at      TEXT    NOT NULL
 );
@@ -160,7 +162,12 @@ BUILTIN_UNIT_PROFILES = (
 #: existing rows get a value. v3 added parcels.closed.
 _ADDITIVE_COLUMNS = (
     ("parcels", "closed", "INTEGER NOT NULL DEFAULT 0"),
+    ("parcels", "owner", "TEXT"),
 )
+
+#: Sentinel for "argument not supplied" in partial updates (distinct from None,
+#: which is a meaningful value — e.g. clearing an owner).
+_UNSET = object()
 
 
 # ---------------------------------------------------------------------------
@@ -430,43 +437,77 @@ class ProjectDB:
         self.conn.execute("DELETE FROM source_scales WHERE source_id = ?", (source_id,))
         self.conn.commit()
 
-    # -- parcels & polygon points (Milestone 4) -----------------------------
+    # -- parcels & polygon points (Milestone 5: many parcels per source) ----
     #
-    # Milestone 4 keeps one parcel (one traced boundary) per source. The parcel
-    # is created lazily the first time a polygon is saved. Points are stored in
+    # A source can carry several independently-traced parcels (khasra
+    # boundaries), each its own row keyed by parcel id. Points are stored in
     # boundary order; pixel coordinates are canonical, and local_x/local_y are
     # populated in SI when a scale is available so the DB always carries the
     # metric coordinates too (refreshed whenever the polygon or scale changes).
+    # `owner` links a source's parcels for owner-wise reporting.
 
-    def get_parcel_for_source(self, source_id: int) -> dict | None:
-        row = self.conn.execute(
-            "SELECT id, name, source_id, scale_m_per_px, notes, closed, created_at, updated_at "
-            "FROM parcels WHERE source_id = ? ORDER BY id LIMIT 1", (source_id,)
-        ).fetchone()
-        return dict(row) if row else None
-
-    def get_or_create_parcel_for_source(self, source_id: int, name: str | None = None) -> int:
-        existing = self.get_parcel_for_source(source_id)
-        if existing is not None:
-            return existing["id"]
+    def create_parcel(self, source_id: int, *, name: str | None = None,
+                    owner: str | None = None) -> int:
+        """Create a new (empty) parcel on *source_id* and return its id."""
         if self.conn.execute("SELECT 1 FROM sources WHERE id = ?", (source_id,)).fetchone() is None:
             raise ProjectError(f"No source with id {source_id} in this project.")
         now = _utcnow()
         cur = self.conn.execute(
-            "INSERT INTO parcels (name, source_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            (name, source_id, now, now),
+            "INSERT INTO parcels (name, source_id, owner, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (name, source_id, owner, now, now),
         )
         self.conn.commit()
         return int(cur.lastrowid)
 
-    def save_polygon(self, source_id: int, pixel_points: list[tuple[float, float]],
-                    *, closed: bool = False, metres_per_pixel: float | None = None,
-                    name: str | None = None) -> int:
-        """Replace the traced boundary for *source_id* with *pixel_points* (in
-        order) and record its *closed* state. Returns the parcel id. Local (SI)
-        coordinates are stored when a scale is given. Passing an empty list
-        clears the boundary but keeps the parcel row."""
-        parcel_id = self.get_or_create_parcel_for_source(source_id, name=name)
+    def list_parcels(self, source_id: int) -> list[dict]:
+        """All parcels for a source, in creation order, each with its live point
+        count (for a list/sidebar)."""
+        rows = self.conn.execute(
+            "SELECT p.id, p.source_id, p.name, p.owner, p.closed, p.created_at, p.updated_at, "
+            "  (SELECT COUNT(*) FROM points WHERE parcel_id = p.id) AS point_count "
+            "FROM parcels p WHERE p.source_id = ? ORDER BY p.id", (source_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_parcel(self, parcel_id: int) -> dict | None:
+        row = self.conn.execute(
+            "SELECT id, source_id, name, owner, closed, scale_m_per_px, notes, "
+            "created_at, updated_at FROM parcels WHERE id = ?", (parcel_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_parcel(self, parcel_id: int, *, name=_UNSET, owner=_UNSET) -> None:
+        """Update the given parcel fields (only those passed). ``owner=None``
+        clears the owner; omitting it leaves the owner unchanged."""
+        sets, params = [], []
+        if name is not _UNSET:
+            sets.append("name = ?")
+            params.append(name)
+        if owner is not _UNSET:
+            sets.append("owner = ?")
+            params.append(owner)
+        if not sets:
+            return
+        sets.append("updated_at = ?")
+        params.append(_utcnow())
+        params.append(parcel_id)
+        self.conn.execute(f"UPDATE parcels SET {', '.join(sets)} WHERE id = ?", params)
+        self.conn.commit()
+
+    def delete_parcel(self, parcel_id: int) -> None:
+        """Delete a parcel and its points (ON DELETE CASCADE)."""
+        self.conn.execute("DELETE FROM parcels WHERE id = ?", (parcel_id,))
+        self.conn.commit()
+
+    def save_parcel_polygon(self, parcel_id: int, pixel_points: list[tuple[float, float]],
+                            *, closed: bool = False,
+                            metres_per_pixel: float | None = None) -> None:
+        """Replace *parcel_id*'s boundary with *pixel_points* (in order) and
+        record its *closed* state. Local (SI) coordinates are stored when a scale
+        is given. An empty list clears the boundary but keeps the parcel row."""
+        if self.conn.execute("SELECT 1 FROM parcels WHERE id = ?", (parcel_id,)).fetchone() is None:
+            raise ProjectError(f"No parcel with id {parcel_id} in this project.")
         self.conn.execute("DELETE FROM points WHERE parcel_id = ?", (parcel_id,))
         for i, (px, py) in enumerate(pixel_points):
             lx = ly = None
@@ -482,7 +523,6 @@ class ProjectDB:
             (_utcnow(), 1 if closed else 0, parcel_id),
         )
         self.conn.commit()
-        return parcel_id
 
     def get_parcel_points(self, parcel_id: int) -> list[dict]:
         rows = self.conn.execute(
@@ -491,30 +531,15 @@ class ProjectDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def get_polygon(self, source_id: int) -> list[tuple[float, float]]:
-        """Return the source's boundary as ordered (pixel_x, pixel_y) tuples,
-        or an empty list if none is stored."""
-        parcel = self.get_parcel_for_source(source_id)
-        if parcel is None:
-            return []
-        return [(p["pixel_x"], p["pixel_y"]) for p in self.get_parcel_points(parcel["id"])]
+    def get_parcel_polygon(self, parcel_id: int) -> list[tuple[float, float]]:
+        """The parcel's boundary as ordered (pixel_x, pixel_y) tuples."""
+        return [(p["pixel_x"], p["pixel_y"]) for p in self.get_parcel_points(parcel_id)]
 
-    def get_polygon_closed(self, source_id: int) -> bool:
-        """Return the stored closed/open state of the source's boundary. False
-        when there is no parcel yet — this is the *saved* state, not inferred
-        from the point count, so an open 3+-point boundary reloads as open."""
-        parcel = self.get_parcel_for_source(source_id)
-        return bool(parcel["closed"]) if parcel is not None else False
-
-    def clear_polygon(self, source_id: int) -> None:
-        """Delete the stored boundary points for a source's parcel (if any) and
-        reset its closed flag."""
-        parcel = self.get_parcel_for_source(source_id)
-        if parcel is not None:
-            self.conn.execute("DELETE FROM points WHERE parcel_id = ?", (parcel["id"],))
-            self.conn.execute("UPDATE parcels SET updated_at = ?, closed = 0 WHERE id = ?",
-                              (_utcnow(), parcel["id"]))
-            self.conn.commit()
+    def get_parcel_closed(self, parcel_id: int) -> bool:
+        """The parcel's stored closed/open state (the *saved* state, not inferred
+        from point count — an open 3+-point boundary reloads as open)."""
+        row = self.conn.execute("SELECT closed FROM parcels WHERE id = ?", (parcel_id,)).fetchone()
+        return bool(row["closed"]) if row is not None else False
 
     # -- unit profiles ------------------------------------------------------
 

@@ -236,133 +236,215 @@ class ProjectDBTests(unittest.TestCase):
             self.assertEqual(sid1, sid2)
             self.assertEqual(len(p.list_sources()), 1)
 
-    # -- polygon persistence (Milestone 4) ----------------------------------
+    # -- parcel polygon persistence (Milestone 5) ---------------------------
 
-    def test_save_and_read_polygon(self):
+    def test_save_and_read_parcel_polygon(self):
         pts = [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)]
         with ProjectDB.create(self.tmp / "proj") as p:
             sid = self._source_id(p)
-            p.save_polygon(sid, pts, metres_per_pixel=0.5)
-            got = p.get_polygon(sid)
-            self.assertEqual(got, pts)  # order preserved
-            parcel = p.get_parcel_for_source(sid)
-            stored = p.get_parcel_points(parcel["id"])
-            self.assertEqual(len(stored), 4)
+            pid = p.create_parcel(sid)
+            p.save_parcel_polygon(pid, pts, metres_per_pixel=0.5)
+            self.assertEqual(p.get_parcel_polygon(pid), pts)  # order preserved
+            stored = p.get_parcel_points(pid)
             self.assertEqual([s["seq"] for s in stored], [0, 1, 2, 3])
             # local (SI) coords populated from the scale: 100 px * 0.5 = 50 m
             self.assertAlmostEqual(stored[1]["local_x"], 50.0)
             self.assertAlmostEqual(stored[2]["local_y"], 25.0)
 
-    def test_save_polygon_without_scale_leaves_local_null(self):
+    def test_save_parcel_polygon_without_scale_leaves_local_null(self):
         pts = [(0.0, 0.0), (10.0, 0.0), (5.0, 8.0)]
         with ProjectDB.create(self.tmp / "proj") as p:
             sid = self._source_id(p)
-            p.save_polygon(sid, pts)
-            parcel = p.get_parcel_for_source(sid)
-            stored = p.get_parcel_points(parcel["id"])
+            pid = p.create_parcel(sid)
+            p.save_parcel_polygon(pid, pts)
+            stored = p.get_parcel_points(pid)
             self.assertTrue(all(s["local_x"] is None and s["local_y"] is None for s in stored))
 
-    def test_save_polygon_replaces_previous(self):
+    def test_save_parcel_polygon_replaces_previous(self):
         with ProjectDB.create(self.tmp / "proj") as p:
             sid = self._source_id(p)
-            p.save_polygon(sid, [(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)])
-            p.save_polygon(sid, [(0.0, 0.0), (5.0, 0.0)])  # re-trace
-            self.assertEqual(p.get_polygon(sid), [(0.0, 0.0), (5.0, 0.0)])
+            pid = p.create_parcel(sid)
+            p.save_parcel_polygon(pid, [(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)])
+            p.save_parcel_polygon(pid, [(0.0, 0.0), (5.0, 0.0)])  # re-trace
+            self.assertEqual(p.get_parcel_polygon(pid), [(0.0, 0.0), (5.0, 0.0)])
 
-    def test_polygon_persists_across_reopen(self):
+    def test_parcel_polygon_persists_across_reopen(self):
         root = self.tmp / "proj"
         pts = [(1.0, 2.0), (3.0, 4.0), (5.0, 1.0)]
         with ProjectDB.create(root) as p:
             sid = self._source_id(p)
-            p.save_polygon(sid, pts, metres_per_pixel=0.1)
+            pid = p.create_parcel(sid)
+            p.save_parcel_polygon(pid, pts, metres_per_pixel=0.1)
         with ProjectDB.open(root) as p2:
-            self.assertEqual(p2.get_polygon(sid), pts)
+            self.assertEqual(p2.get_parcel_polygon(pid), pts)
 
-    def test_clear_polygon_keeps_parcel(self):
+    def test_empty_save_clears_points_keeps_parcel(self):
         with ProjectDB.create(self.tmp / "proj") as p:
             sid = self._source_id(p)
-            p.save_polygon(sid, [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)])
-            pid = p.get_parcel_for_source(sid)["id"]
-            p.clear_polygon(sid)
-            self.assertEqual(p.get_polygon(sid), [])
-            self.assertIsNotNone(p.get_parcel_for_source(sid))  # parcel row remains
-            self.assertEqual(p.get_parcel_points(pid), [])
+            pid = p.create_parcel(sid)
+            p.save_parcel_polygon(pid, [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)])
+            p.save_parcel_polygon(pid, [])
+            self.assertEqual(p.get_parcel_polygon(pid), [])
+            self.assertIsNotNone(p.get_parcel(pid))  # parcel row remains
 
-    def test_one_parcel_per_source(self):
+    def test_save_parcel_polygon_rejects_unknown_parcel(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            with self.assertRaises(ProjectError):
+                p.save_parcel_polygon(9999, [(0.0, 0.0), (1.0, 0.0)])
+
+    def test_create_parcel_rejects_unknown_source(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            with self.assertRaises(ProjectError):
+                p.create_parcel(9999)
+
+    # -- multiple parcels per source (Milestone 5) --------------------------
+
+    def test_multiple_parcels_on_one_source_round_trip(self):
+        root = self.tmp / "proj"
+        a = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)]
+        b = [(50.0, 50.0), (60.0, 50.0), (60.0, 60.0), (50.0, 60.0)]
+        with ProjectDB.create(root) as p:
+            sid = self._source_id(p)
+            pa = p.create_parcel(sid, owner="Ramesh")
+            pb = p.create_parcel(sid, owner="Suresh")
+            p.save_parcel_polygon(pa, a, closed=True)
+            p.save_parcel_polygon(pb, b, closed=False)
+            self.assertEqual(len(p.list_parcels(sid)), 2)
+        with ProjectDB.open(root) as p2:
+            parcels = p2.list_parcels(sid)
+            self.assertEqual([pc["id"] for pc in parcels], [pa, pb])
+            self.assertEqual(p2.get_parcel_polygon(pa), a)
+            self.assertEqual(p2.get_parcel_polygon(pb), b)
+            self.assertTrue(p2.get_parcel_closed(pa))
+            self.assertFalse(p2.get_parcel_closed(pb))
+            self.assertEqual([pc["owner"] for pc in parcels], ["Ramesh", "Suresh"])
+            self.assertEqual([pc["point_count"] for pc in parcels], [3, 4])
+
+    def test_editing_one_parcel_does_not_corrupt_another(self):
         with ProjectDB.create(self.tmp / "proj") as p:
             sid = self._source_id(p)
-            id1 = p.get_or_create_parcel_for_source(sid)
-            id2 = p.get_or_create_parcel_for_source(sid)
-            self.assertEqual(id1, id2)
+            pa = p.create_parcel(sid)
+            pb = p.create_parcel(sid)
+            a = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)]
+            b = [(1.0, 1.0), (2.0, 2.0), (3.0, 1.0)]
+            p.save_parcel_polygon(pa, a, closed=True)
+            p.save_parcel_polygon(pb, b, closed=False)
+            # Re-trace A entirely; B must be untouched.
+            p.save_parcel_polygon(pa, [(9.0, 9.0), (8.0, 8.0)], closed=False)
+            self.assertEqual(p.get_parcel_polygon(pb), b)
+            self.assertFalse(p.get_parcel_closed(pb))
 
-    def test_get_polygon_empty_when_none(self):
+    def test_delete_parcel_leaves_others_intact(self):
         with ProjectDB.create(self.tmp / "proj") as p:
             sid = self._source_id(p)
-            self.assertEqual(p.get_polygon(sid), [])
+            pa = p.create_parcel(sid)
+            pb = p.create_parcel(sid)
+            p.save_parcel_polygon(pa, [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)])
+            p.save_parcel_polygon(pb, [(5.0, 5.0), (6.0, 5.0), (6.0, 6.0)])
+            p.delete_parcel(pa)
+            self.assertIsNone(p.get_parcel(pa))
+            self.assertEqual(p.get_parcel_points(pa), [])  # points cascaded away
+            self.assertEqual(len(p.list_parcels(sid)), 1)
+            self.assertEqual(p.get_parcel_polygon(pb), [(5.0, 5.0), (6.0, 5.0), (6.0, 6.0)])
+
+    def test_owner_round_trips(self):
+        root = self.tmp / "proj"
+        with ProjectDB.create(root) as p:
+            sid = self._source_id(p)
+            pid = p.create_parcel(sid, owner="Ramesh Kumar")
+            self.assertEqual(p.get_parcel(pid)["owner"], "Ramesh Kumar")
+            p.update_parcel(pid, owner="Ramesh K.")
+            self.assertEqual(p.get_parcel(pid)["owner"], "Ramesh K.")
+            p.update_parcel(pid, owner=None)  # cleared
+            self.assertIsNone(p.get_parcel(pid)["owner"])
+            p.update_parcel(pid, owner="Final")
+        with ProjectDB.open(root) as p2:
+            self.assertEqual(p2.get_parcel(pid)["owner"], "Final")
+
+    def test_list_parcels_empty_when_none(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            self.assertEqual(p.list_parcels(sid), [])
 
     # -- closed/open state persistence (v3) ---------------------------------
 
     def test_closed_state_defaults_open(self):
         with ProjectDB.create(self.tmp / "proj") as p:
             sid = self._source_id(p)
-            p.save_polygon(sid, [(0.0, 0.0), (10.0, 0.0), (5.0, 8.0)])  # closed not passed
-            self.assertFalse(p.get_polygon_closed(sid))
+            pid = p.create_parcel(sid)
+            p.save_parcel_polygon(pid, [(0.0, 0.0), (10.0, 0.0), (5.0, 8.0)])  # closed not passed
+            self.assertFalse(p.get_parcel_closed(pid))
 
     def test_open_boundary_with_three_points_stays_open(self):
         root = self.tmp / "proj"
         pts = [(0.0, 0.0), (10.0, 0.0), (5.0, 8.0)]
         with ProjectDB.create(root) as p:
             sid = self._source_id(p)
-            p.save_polygon(sid, pts, closed=False)   # explicitly open, 3 points
+            pid = p.create_parcel(sid)
+            p.save_parcel_polygon(pid, pts, closed=False)   # explicitly open, 3 points
         with ProjectDB.open(root) as p2:
-            self.assertEqual(p2.get_polygon(sid), pts)
-            self.assertFalse(p2.get_polygon_closed(sid))  # NOT auto-closed on reload
+            self.assertEqual(p2.get_parcel_polygon(pid), pts)
+            self.assertFalse(p2.get_parcel_closed(pid))     # NOT auto-closed on reload
 
     def test_closed_boundary_round_trips_closed(self):
         root = self.tmp / "proj"
         pts = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
         with ProjectDB.create(root) as p:
             sid = self._source_id(p)
-            p.save_polygon(sid, pts, closed=True)
+            pid = p.create_parcel(sid)
+            p.save_parcel_polygon(pid, pts, closed=True)
         with ProjectDB.open(root) as p2:
-            self.assertTrue(p2.get_polygon_closed(sid))
+            self.assertTrue(p2.get_parcel_closed(pid))
 
     def test_resaving_toggles_closed_state(self):
         with ProjectDB.create(self.tmp / "proj") as p:
             sid = self._source_id(p)
+            pid = p.create_parcel(sid)
             pts = [(0.0, 0.0), (10.0, 0.0), (5.0, 8.0)]
-            p.save_polygon(sid, pts, closed=True)
-            self.assertTrue(p.get_polygon_closed(sid))
-            p.save_polygon(sid, pts, closed=False)  # re-open
-            self.assertFalse(p.get_polygon_closed(sid))
+            p.save_parcel_polygon(pid, pts, closed=True)
+            self.assertTrue(p.get_parcel_closed(pid))
+            p.save_parcel_polygon(pid, pts, closed=False)  # re-open
+            self.assertFalse(p.get_parcel_closed(pid))
 
-    def test_clear_polygon_resets_closed(self):
-        with ProjectDB.create(self.tmp / "proj") as p:
-            sid = self._source_id(p)
-            p.save_polygon(sid, [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)], closed=True)
-            p.clear_polygon(sid)
-            self.assertFalse(p.get_polygon_closed(sid))
+    # -- additive column migrations -----------------------------------------
 
     def test_v2_project_gains_closed_column_on_open(self):
-        """A v2 project (parcels table without the `closed` column) upgrades
+        """A v2 project (parcels without the `closed` column) upgrades
         additively on open and can then store the closed state."""
         root = self.tmp / "legacy2"
         with ProjectDB.create(root) as p:
             sid = self._source_id(p)
-            p.save_polygon(sid, [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)], closed=True)
-        # Downgrade to look like a v2 file: drop the column, reset the version.
+            pid = p.create_parcel(sid)
+            p.save_parcel_polygon(pid, [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)], closed=True)
         conn = sqlite3.connect(str(root / "project.db"))
         conn.execute("ALTER TABLE parcels DROP COLUMN closed")
         conn.execute("PRAGMA user_version = 2")
         conn.commit()
         conn.close()
-        # Opening migrates it: the column is re-added, prior points survive.
         with ProjectDB.open(root) as p2:
             self.assertEqual(p2.schema_version, SCHEMA_VERSION)
-            self.assertEqual(len(p2.get_polygon(sid)), 3)   # points preserved
-            self.assertFalse(p2.get_polygon_closed(sid))    # re-added column defaults open
-            p2.save_polygon(sid, p2.get_polygon(sid), closed=True)
-            self.assertTrue(p2.get_polygon_closed(sid))
+            self.assertEqual(len(p2.get_parcel_polygon(pid)), 3)  # points preserved
+            self.assertFalse(p2.get_parcel_closed(pid))           # re-added column defaults open
+            p2.save_parcel_polygon(pid, p2.get_parcel_polygon(pid), closed=True)
+            self.assertTrue(p2.get_parcel_closed(pid))
+
+    def test_v3_project_gains_owner_column_on_open(self):
+        """A v3 project (parcels without the `owner` column) upgrades
+        additively on open and can then store the owner."""
+        root = self.tmp / "legacy3"
+        with ProjectDB.create(root) as p:
+            sid = self._source_id(p)
+            pid = p.create_parcel(sid)
+        conn = sqlite3.connect(str(root / "project.db"))
+        conn.execute("ALTER TABLE parcels DROP COLUMN owner")
+        conn.execute("PRAGMA user_version = 3")
+        conn.commit()
+        conn.close()
+        with ProjectDB.open(root) as p2:
+            self.assertEqual(p2.schema_version, SCHEMA_VERSION)
+            self.assertIsNone(p2.get_parcel(pid)["owner"])  # re-added column, null default
+            p2.update_parcel(pid, owner="Ramesh")
+            self.assertEqual(p2.get_parcel(pid)["owner"], "Ramesh")
 
 
 if __name__ == "__main__":

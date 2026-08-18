@@ -127,6 +127,12 @@ Use multiple methods and cross-validate when more than one is available:
   perimeter/area as points are placed
 - Support undo, point removal, and re-ordering
 - Export both pixel and real-world coordinates (JSON/CSV/GeoJSON-ish)
+- **Multiple parcels per source (confirmed requirement).** One sheet
+  commonly contains several khasra boundaries under a single owner. The
+  tool must support tracing and independently measuring several polygons
+  on the same loaded source, each becoming its own parcel record, not one
+  parcel per file. This also means "owner" becomes a linking field across
+  multiple parcels, used for owner-wise reporting (see Reporting below).
 
 ## Measurement & unit handling
 - Perimeter = sum of segment distances between consecutive polygon points
@@ -147,15 +153,102 @@ Use multiple methods and cross-validate when more than one is available:
     correct units; everything else (Bigha, Biswa, or any other local measure)
     is a user-added profile from day one
 
-## Summary output
-One export per traced parcel, combining:
-- Identification fields (entered by user)
-- Segment lengths (each edge, in real units)
-- Perimeter and area (in multiple units)
-- Scale-determination method used and confidence/cross-check note
-- Source file reference and thumbnail/crop of the traced region
-Export as PDF (primary, shareable) and CSV/JSON (for record-keeping or
-importing elsewhere).
+## Reporting
+Three distinct outputs, not one generic report — each serves a different
+purpose:
+
+1. **Owner-wise summary report.** Grouped by owner: every khasra/parcel
+   under that owner, its identification fields, area and perimeter, and a
+   **total row** (combined area across all their parcels). This is the
+   standard format revenue-land summaries are expected in, and is the
+   primary deliverable most sessions will end with.
+2. **Segment-length / boundary-description report — a separate, specific
+   report type, not a byproduct of the summary.** Traditional boundary
+   descriptions list each edge with direction and length (e.g. "North:
+   bounded by [X], 45 m"). The user should be able to **select which
+   segments to include** (not forced to include every edge) — e.g. only
+   boundary edges shared with a named neighboring feature, excluding
+   internal/construction lines. This needs its own export path, since its
+   structure (one row per selected segment) differs from the parcel-summary
+   structure (one row per parcel).
+3. **Visual confidence overlay.** Before trusting a report, the user should
+   be able to see the traced boundary drawn directly over the source scan,
+   selectable/toggleable per parcel, so overlap/misalignment is visible at
+   a glance rather than trusted blindly. This is a review step, not a
+   report format — likely a canvas mode rather than an export.
+
+All exports: PDF (primary, shareable) and CSV/JSON (record-keeping /
+import elsewhere). Each report also carries: scale-determination method
+used and its confidence/cross-check note, and source file reference.
+
+## Location fixing (local georeferencing)
+A second core hard problem, structurally parallel to scale-determination
+but solving for *position* instead of *size*. The user marks well-defined,
+durable reference features already visible on the sheet — tubewell,
+building, or other long-lived structures (school, water tank) — the same
+way scale-calibration points are marked. Two modes, since what's known
+about those reference points varies by survey age:
+
+1. **GPS-anchored mode** (modern surveys, or older surveys where the
+   landmark still exists and can be located today). The user supplies known
+   real-world GPS coordinates for each marked reference point. With 2+
+   points, compute a coordinate transform between sheet-pixel space and
+   real-world GPS space, giving the traced parcel an absolute location —
+   and as a side benefit, this also cross-checks against the scale factor
+   from Milestone 3, since GPS-anchored reference points imply a scale too.
+2. **Distance/trigonometry mode** (older surveys, no GPS available). The
+   user supplies a known real-world distance (and bearing, if known) from a
+   reference point to the parcel. Position is computed by trigonometry —
+   this doesn't require the reference point's own absolute coordinates,
+   only the relationship between it and the parcel, so it still works when
+   nothing on the sheet has ever been GPS-surveyed.
+3. **Cross-validation** — same principle as scale-determination: when 3+
+   reference points are available, compare the position each one implies
+   and surface disagreement rather than trusting one silently. With only
+   one weak reference, say so explicitly rather than presenting a
+   confident-looking location.
+
+Output: the parcel's location description (GPS coordinates where available,
+otherwise "X m from [landmark] bearing Y°"), attached to the parcel record
+and included in reports where location was requested, not just area.
+
+## Data quality / noise handling
+Two distinct pieces, different risk profiles:
+
+1. **Image preprocessing** (denoise/contrast enhancement on the scan before
+   display/tracing). Standard, mechanical image processing — low risk,
+   directly helps manual tracing precision on faint or degraded scans, and
+   is also a prerequisite for decent results from the tracing-assist
+   feature below. Worth doing early since it's a broadly useful, low-risk
+   improvement.
+2. **Point-data guard rails** — flag likely-accidental input (e.g. a new
+   point placed implausibly close to the previous one, suggesting a
+   double-click) at the moment of placement. This is deliberately a
+   **warning, not automated correction**: the source project's own hard
+   lessons (see below) already showed that automated "is this point a real
+   corner or noise" judgment is unreliable — a simple flag the user can
+   dismiss or act on is the right level of automation here, not a silent
+   fix.
+
+## Semi-automated tracing assist (boundary line-following)
+User marks two points on a printed/drawn boundary line; the tool follows
+that line automatically between them, rather than just connecting the two
+points with a straight line. This is the same class of technique as
+"magnetic lasso" / "intelligent scissors" in tools like Photoshop and
+GIMP — a cost-minimizing path search over an edge/gradient map between the
+two points — and should be built the same way: adopt the established
+technique rather than inventing one.
+
+**This carries the same caution flagged in the source project's hard
+lessons**: automated path-following in dense, faint, or nearly-collinear
+regions is genuinely unreliable, and a wrong auto-path is worse than a
+slower manual one on a document that may feed into an official land
+record. So: the followed path is always shown for confirmation before
+being accepted into the polygon, never applied silently, and manual
+point-by-point tracing remains available as the fallback for any segment
+where the auto-follow gets it wrong. This is a harder feature — sequence
+it after image preprocessing (above) and treat it as one of the later
+milestones, alongside grid auto-detection.
 
 ## Is HTML needed? (answered)
 No. For a true standalone desktop app, build the canvas natively
@@ -285,24 +378,39 @@ some-parcel-project/
   distance or area before trusting a new document type).
 
 ## Suggested milestones
-1. Project folder structure + SQLite schema: create/open a project folder
-   (`project.db` + `sources/` + `exports/`), confirm it works identically
-   from local disk and a copied/mounted pen drive
-2. Open a PDF and an image file, render to screen, pan/zoom (native
-   `QGraphicsView` canvas)
-3. Manual two-point scale entry — get end-to-end measurement working with the
-   simplest possible calibration first (SI storage only at this stage)
-4. Polygon point-marking with live segment/perimeter/area readout, saved to
-   the project DB
-5. Unit profiles: sq m / sq ft / acre / hectare built in, plus user-defined
+1. ✅ Project folder structure + SQLite schema — done
+2. ✅ Open a PDF and an image file, render to screen, pan/zoom — done
+3. ✅ Manual two-point scale entry — done
+4. ✅ Polygon point-marking with live segment/perimeter/area readout, saved
+   to the project DB, incl. fine-tune/nudge, reliable cancel, precision
+   crosshair, and the explicit `closed` state — done
+5. **Multi-parcel per source** — several khasra boundaries traced and
+   measured independently on one loaded sheet, each its own parcel record;
+   owner as a linking field across a source's parcels
+6. Unit profiles: sq m / sq ft / acre / hectare built in, plus user-defined
    local unit profiles (save/select, e.g. a "Bigha — Jaipur" profile)
-6. Land-type templates (rural-agri / rural-residential / urban) + editable
-   identification-fields form, tied to a traced parcel
-7. PDF/CSV/JSON summary export combining geometry + identification fields
-8. PDF metadata-based scale auto-detection, shown alongside manual entry for
-   comparison
-9. DXF support (open file, read header units/scale, render entities)
-10. Grid/reference-content auto-detection (hardest, do last)
+7. Land-type templates (rural-agri / rural-residential / urban) + editable
+   identification-fields form, tied to a traced parcel, incl. owner field
+8. Owner-wise summary report (all parcels for an owner + total), PDF/CSV/
+   JSON export
+9. Segment-length / boundary-description report — separate report type,
+   user-selectable segments
+10. Visual confidence overlay — traced boundary shown over the source scan,
+    toggleable per parcel
+11. PDF metadata-based scale auto-detection, shown alongside manual entry
+    for comparison
+12. DXF support (open file, read header units/scale, render entities)
+13. Location-fixing (local georeferencing): mark on-sheet reference points
+    (tubewell, building, other durable structures), GPS-anchored mode and
+    distance/trigonometry mode, cross-validated when 3+ references are used
+14. Image preprocessing (denoise/contrast) for scans — helps manual tracing
+    precision now, and is a prerequisite for milestone 16
+15. Point-data guard rails — flag (don't auto-correct) likely-accidental
+    duplicate/near points at placement time
+16. Semi-automated tracing assist — follow a printed/drawn boundary line
+    between two user-marked points, always shown for confirmation before
+    being accepted, manual tracing remains the fallback
+17. Grid/reference-content auto-detection (hardest, do last)
 
 ## Attached reference files
 - `point_picker.html` — working browser-based point-marking prototype

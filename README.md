@@ -41,6 +41,14 @@ browser prototypes whose *logic* seeds this tool are kept under
   **Esc** fully cancels an in-progress pick with no residual points. A toggleable
   full-window precision crosshair (dark core + light halo, CAD/GIS style) is on
   by default while calibrating scale, off by default while tracing.
+- **Milestone 5 — multiple parcels per source**: one sheet can hold several
+  independently-traced parcels, each its own record. A **Parcels** sidebar lists
+  them, lets you add / delete / switch the active one, and edit its **owner**
+  (the field parcels are grouped by for owner-wise reporting later). Each parcel
+  draws in a distinct colour; the active (editable) one is emphasised and the
+  others show as context. Points, closed-state, and owner persist and restore
+  per parcel. No structural schema change was needed (`parcels.source_id` already
+  allows many); `owner` was added as an additive column (v4).
 
 Later milestones (unit profiles, identification templates, summary export, DXF)
 are scaffolded as docstring-only stubs under `src/` and will be filled in one
