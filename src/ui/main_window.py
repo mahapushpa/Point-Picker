@@ -36,7 +36,10 @@ from PySide6.QtWidgets import (
 
 from ..core.geometry import measure_polygon
 from ..core.project_db import ProjectDB, ProjectError
-from ..core.scale import compute_two_point_scale, TwoPointScale
+from ..core.scale import (
+    compute_two_point_scale, compare_scales, metadata_scale_from_page,
+    TwoPointScale, METHOD_TWO_POINT, METHOD_PDF_METADATA,
+)
 from ..core.selection import parcel_at_point, parcels_in_rect
 from ..core import units
 from ..export import report as report_export
@@ -225,6 +228,15 @@ class MainWindow(QMainWindow):
         set_scale.setToolTip("Set scale: click two points a known distance apart")
         set_scale.triggered.connect(self.begin_scale_calibration)
         bar.addAction(set_scale)
+
+        # PDF-metadata scale (Milestone 14): a second candidate, PDF sources only.
+        self._pdf_scale_action = QAction("PDF scale", self)
+        self._pdf_scale_action.setToolTip(
+            "Derive a scale from this PDF page's physical size, and cross-check it "
+            "against the manual scale. PDF sources only; offered, never auto-applied.")
+        self._pdf_scale_action.triggered.connect(self.propose_pdf_metadata_scale)
+        self._pdf_scale_action.setEnabled(False)   # enabled once a PDF is loaded
+        bar.addAction(self._pdf_scale_action)
 
         bar.addSeparator()
         for text, tooltip, slot in (
@@ -1030,6 +1042,7 @@ class MainWindow(QMainWindow):
         self._active_parcel_id = None
         self._selected_parcel_ids.clear()   # selection is per-source; start fresh
         self._apply_display_image()     # honour the preprocessing toggle for the new file
+        self._sync_pdf_scale_action()   # PDF-metadata scale is offered for PDFs only
         self._attach_source_to_project()
         self._update_scale_readout()
         self._update_measure_readout()
@@ -1119,6 +1132,95 @@ class MainWindow(QMainWindow):
         self._update_scale_readout()
         self._update_measure_readout()  # readout switches from px to metres
         self._status.setText(f"Scale set from {scale.pixel_distance:.1f} px = {distance:g} m.")
+
+    # -- PDF-metadata scale (Milestone 14) ----------------------------------
+
+    def _current_is_pdf(self) -> bool:
+        return (self._current_path is not None
+                and Path(self._current_path).suffix.lower() == ".pdf")
+
+    def _sync_pdf_scale_action(self) -> None:
+        """Enable the PDF-metadata scale action only for PDF sources (images carry
+        no reliable scale metadata, per the brief's file-format scope)."""
+        self._pdf_scale_action.setEnabled(self._current_is_pdf() and self._raw_raster is not None)
+
+    def _manual_scale(self) -> TwoPointScale | None:
+        """The current scale iff it came from manual M3 calibration — the baseline
+        the metadata candidate is cross-checked against."""
+        if self._scale is not None and self._scale.method == METHOD_TWO_POINT:
+            return self._scale
+        return None
+
+    def _compute_metadata_scale(self):
+        """Read this PDF page's physical size and derive a scale candidate, or show
+        why it can't and return None. Never applies anything."""
+        try:
+            from ..io.pdf_loader import read_page_size_points
+            w_pt, h_pt = read_page_size_points(self._current_path, page=0)
+            return metadata_scale_from_page(w_pt, h_pt,
+                                            self._raw_raster.width, self._raw_raster.height)
+        except Exception as exc:   # implausible/missing metadata, decode error, ...
+            QMessageBox.information(
+                self, "No usable PDF scale metadata",
+                "Could not derive a scale from this PDF's page size:\n\n"
+                f"{exc}\n\nUse the manual two-point scale instead.")
+            return None
+
+    def propose_pdf_metadata_scale(self) -> None:
+        """Offer a PDF-metadata-derived scale (method 1). If a manual scale already
+        exists, show both and their agreement/disagreement (method 4) rather than
+        silently choosing. Nothing is applied without an explicit confirmation."""
+        if not self._current_is_pdf() or self._raw_raster is None:
+            QMessageBox.information(
+                self, "Not a PDF",
+                "PDF metadata scale is only available for PDF sources — images have "
+                "no reliable embedded scale.")
+            return
+        meta = self._compute_metadata_scale()
+        if meta is None:
+            return
+
+        manual = self._manual_scale()
+        meta_line = (f"PDF page {meta.width_pt:.0f} × {meta.height_pt:.0f} pt "
+                     f"({meta.width_m:.3f} × {meta.height_m:.3f} m)\n"
+                     f"→ PDF-metadata scale: 1 px = {meta.metres_per_pixel:.4g} m")
+        if manual is not None:
+            cc = compare_scales(manual.metres_per_pixel, meta.metres_per_pixel)
+            body = (f"Manual scale: 1 px = {manual.metres_per_pixel:.4g} m\n"
+                    f"{meta_line}\n\n{cc.describe()}\n\n"
+                    "Replace the manual scale with the PDF-metadata scale?")
+            if QMessageBox.question(self, "Two scales — cross-check", body) \
+                    == QMessageBox.StandardButton.Yes:
+                self._apply_metadata_scale(meta)
+            else:
+                self._status.setText("Kept manual scale. " + cc.describe())
+        else:
+            body = (f"{meta_line}\n\n"
+                    "Valid only if the page was generated at true (1:1) physical "
+                    "scale. Use it as this source's scale?\n"
+                    "(You can still set a manual scale instead.)")
+            if QMessageBox.question(self, "Scale from PDF metadata", body) \
+                    == QMessageBox.StandardButton.Yes:
+                self._apply_metadata_scale(meta)
+            else:
+                self._status.setText("PDF-metadata scale not applied.")
+
+    def _apply_metadata_scale(self, meta) -> None:
+        """Adopt a metadata scale candidate as the source's scale (only ever from
+        an explicit user confirmation in :meth:`propose_pdf_metadata_scale`)."""
+        self._scale = TwoPointScale(
+            p1=(0.0, 0.0), p2=(0.0, 0.0), pixel_distance=0.0, real_distance_m=0.0,
+            metres_per_pixel=meta.metres_per_pixel, method=METHOD_PDF_METADATA)
+        if self._project is not None and self._source_id is not None:
+            self._project.set_source_scale(
+                self._source_id, meta.metres_per_pixel, method=METHOD_PDF_METADATA,
+                note=f"PDF page {meta.width_pt:.0f}x{meta.height_pt:.0f} pt "
+                     f"({meta.width_m:.3f}x{meta.height_m:.3f} m)")
+            self._project.refresh_source_vertices_si(self._source_id, meta.metres_per_pixel)
+        self._update_scale_readout()
+        self._update_measure_readout()
+        self._status.setText(
+            f"Scale set from PDF metadata: 1 px = {meta.metres_per_pixel:.4g} m.")
 
     # -- polygon tracing ----------------------------------------------------
 
@@ -1562,8 +1664,10 @@ class MainWindow(QMainWindow):
             self._scale_readout.setText("Scale: not set")
         else:
             s = self._scale
+            source = " [PDF metadata]" if s.method == METHOD_PDF_METADATA else ""
             self._scale_readout.setText(
-                f"Scale: 1 px = {s.metres_per_pixel:.4g} m   (1 m = {s.pixels_per_metre:.4g} px)")
+                f"Scale: 1 px = {s.metres_per_pixel:.4g} m   "
+                f"(1 m = {s.pixels_per_metre:.4g} px){source}")
 
     def _update_measure_readout(self) -> None:
         pts = self.canvas.polygon_points()

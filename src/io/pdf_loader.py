@@ -5,8 +5,10 @@ with a fallback to the legacy ``fitz`` name) to rasterise a page, and returns a
 neutral :class:`~src.io.raster.RasterImage` (RGBA bytes) — never a Qt type — so
 this stays testable with no GUI running.
 
-Reading the PDF's own physical page size as a scale clue is a Milestone 8
-concern and is deliberately not done here; Milestone 2 only renders to screen.
+Milestone 2 rendered to screen; Milestone 14 adds :func:`read_page_size_points`,
+which reads the page's own physical size (its MediaBox, in points) as the raw
+input for metadata-based scale detection. That's still a pure metadata read — the
+scale arithmetic and plausibility checks live in ``src.core.scale``.
 """
 
 from __future__ import annotations
@@ -29,6 +31,24 @@ def page_count(path) -> int:
     """Number of pages in the PDF at *path*."""
     with _fitz.open(str(path)) as doc:
         return doc.page_count
+
+
+def read_page_size_points(path, page: int = 0) -> tuple[float, float]:
+    """The physical size of a PDF page in points (1/72 inch) as ``(width, height)``.
+
+    This is the page's own laid-out rectangle (rotation applied) — the raw input
+    for metadata-based scale detection (Milestone 14). A pure metadata read; it
+    renders nothing. Raises ``FileNotFoundError`` if the file is missing and
+    ``ValueError`` for an out-of-range page.
+    """
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"PDF not found: {p}")
+    with _fitz.open(str(p)) as doc:
+        if page < 0 or page >= doc.page_count:
+            raise ValueError(f"page {page} out of range (document has {doc.page_count} page(s))")
+        rect = doc.load_page(page).rect
+        return (float(rect.width), float(rect.height))
 
 
 def load_pdf_page(path, page: int = 0, dpi: int = DEFAULT_DPI) -> RasterImage:
