@@ -20,7 +20,10 @@ from src.core.scale import (
 
 try:
     import ezdxf
-    from src.io.dxf_loader import render_dxf, read_dxf_header_units
+    from src.io.dxf_loader import (
+        render_dxf, read_dxf_header_units,
+        TARGET_M_PER_PX, MIN_MAX_PX, MAX_MAX_PX, UNITLESS_MAX_PX,
+    )
     from src.io.raster import open_raster, RasterImage
     _HAVE_EZDXF = True
 except Exception:  # pragma: no cover
@@ -193,6 +196,66 @@ class DxfRenderTests(unittest.TestCase):
         # Inches would scale the same render down by 0.0254.
         cand_in = dxf_header_scale(1, r.units_per_pixel)
         self.assertAlmostEqual(cand_in.metres_per_pixel, 0.0254 * r.units_per_pixel)
+
+
+@unittest.skipUnless(_HAVE_EZDXF, "ezdxf not available")
+class ExtentAwareResolutionTests(unittest.TestCase):
+    def _square(self, side, insunits=6):
+        d = Path(tempfile.mkdtemp()) / f"sq{side}.dxf"
+        doc = ezdxf.new()
+        doc.header["$INSUNITS"] = insunits
+        msp = doc.modelspace()
+        for a, b in [((0, 0), (side, 0)), ((side, 0), (side, side)),
+                     ((side, side), (0, side)), ((0, side), (0, 0))]:
+            msp.add_line(a, b)
+        doc.saveas(str(d))
+        return d
+
+    def _longest(self, r):
+        return max(r.raster.width, r.raster.height)
+
+    def test_small_extent_renders_finer_than_target(self):
+        # A 20 m plot: resolution is chosen (floored at MIN_MAX_PX) so each pixel is
+        # well finer than the target, and precision is NOT flagged as limited.
+        r = render_dxf(self._square(20.0, insunits=6))
+        self.assertEqual(self._longest(r), MIN_MAX_PX)
+        self.assertLess(r.metres_per_pixel, TARGET_M_PER_PX)   # finer than target
+        self.assertFalse(r.precision_limited)
+
+    def test_medium_extent_hits_target_below_ceiling(self):
+        # A 200 m sheet needs more than the floor but less than the ceiling, so it
+        # lands right around the target precision without being flagged.
+        r = render_dxf(self._square(200.0, insunits=6))
+        self.assertGreater(self._longest(r), MIN_MAX_PX)
+        self.assertLess(self._longest(r), MAX_MAX_PX)
+        self.assertLessEqual(r.metres_per_pixel, TARGET_M_PER_PX + 1e-9)
+        self.assertFalse(r.precision_limited)
+
+    def test_large_extent_capped_at_ceiling_and_flagged(self):
+        # A 3 km village-scale sheet can't hit the target even at the ceiling: it
+        # renders at MAX_MAX_PX and reports precision_limited so the user is warned.
+        r = render_dxf(self._square(3000.0, insunits=6))
+        self.assertEqual(self._longest(r), MAX_MAX_PX)
+        self.assertGreater(r.metres_per_pixel, TARGET_M_PER_PX)
+        self.assertTrue(r.precision_limited)
+
+    def test_unitless_uses_fixed_default_and_is_never_flagged(self):
+        # No real-world unit -> a metres target is meaningless: fixed default size,
+        # no precision figure, never flagged.
+        r = render_dxf(self._square(50.0, insunits=0))
+        self.assertEqual(self._longest(r), UNITLESS_MAX_PX)
+        self.assertIsNone(r.metres_per_pixel)
+        self.assertFalse(r.precision_limited)
+
+    def test_explicit_max_px_override_is_honoured(self):
+        # Forcing max_px overrides the extent-aware logic exactly...
+        r = render_dxf(self._square(10.0, insunits=6), max_px=500)
+        self.assertEqual(self._longest(r), 500)
+        # ...and a forced-too-small value on a large drawing is still honestly
+        # reported as precision-limited.
+        big = render_dxf(self._square(3000.0, insunits=6), max_px=1000)
+        self.assertEqual(self._longest(big), 1000)
+        self.assertTrue(big.precision_limited)
 
 
 if __name__ == "__main__":

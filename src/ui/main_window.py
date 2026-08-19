@@ -1073,9 +1073,16 @@ class MainWindow(QMainWindow):
         self._update_scale_readout()
         self._update_measure_readout()
         msg = f"{Path(path).name}   —   {raster.width} × {raster.height} px"
-        if dxf_info is not None and dxf_info.skipped_entity_types:
-            # Flag, never silently drop, entity types we don't render (M15 scope).
-            msg += f"   (DXF: not drawn — {', '.join(dxf_info.skipped_entity_types)})"
+        if dxf_info is not None:
+            if dxf_info.skipped_entity_types:
+                # Flag, never silently drop, entity types we don't render (M15 scope).
+                msg += f"   (DXF: not drawn — {', '.join(dxf_info.skipped_entity_types)})"
+            if dxf_info.precision_limited:
+                # Be honest when a large drawing can't be rendered finely enough for
+                # precise tracing, rather than letting the user discover it later.
+                msg += (f"   (precision limited: ~{dxf_info.metres_per_pixel:.2f} m/px, "
+                        f"coarser than the {dxf_info.precision_target_m:g} m/px target — "
+                        "large drawing; trace critical corners with care)")
         self._status.setText(msg)
         self._update_title()
 

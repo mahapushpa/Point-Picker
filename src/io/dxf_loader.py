@@ -25,26 +25,56 @@ silently dropped, so it is always clear what was not drawn. Curved/So-far
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import ceil
 from pathlib import Path
 
 import ezdxf
 from PIL import Image, ImageDraw
 
+from ..core.scale import metres_per_unit_from_insunits
 from .raster import RasterImage
 
 #: Entity types we rasterise. Everything else is reported, not drawn.
 _SUPPORTED = ("LINE", "LWPOLYLINE", "POLYLINE")
 
-#: Longest side of the rendered raster, in pixels, and the blank border around
-#: the drawing. The drawing is scaled to fit; this fixes drawing-units-per-pixel.
-DEFAULT_MAX_PX = 1600
+#: Blank border (px) around the drawing in the rendered raster.
 DEFAULT_PADDING_PX = 20
+
+# --- extent-aware render resolution ---------------------------------------
+#
+# The render resolution is chosen from the drawing's *real-world* extent so that
+# a pixel represents a small enough real distance for precise corner tracing —
+# rather than a fixed pixel ceiling, which would render a village-scale sheet far
+# too coarsely (the same precision concern as PDF render DPI). We target a
+# metres-per-pixel figure and compute the pixels needed to hit it, clamped to a
+# memory-sane ceiling; if even the ceiling can't reach the target, that is
+# reported (precision_limited) rather than silently rendering coarse.
+
+#: Target render precision: real-world metres per pixel. 0.05 m (5 cm) keeps
+#: rasterisation error well below manual click/line-width error at parcel-corner
+#: scale, so tracing precision is limited by the user, not the raster — while
+#: staying far finer than the ~1% area agreement the brief treats as trustworthy.
+TARGET_M_PER_PX = 0.05
+
+#: Floor for the longest side (px): small drawings still render large enough to
+#: trace comfortably (and end up finer than the target, which is fine).
+MIN_MAX_PX = 1600
+
+#: Memory-sane ceiling for the longest side (px). 8000 px longest side is ~256 MB
+#: RGBA only in the pathological square-huge case; typical wide sheets are much
+#: less. A drawing large enough to need more than this triggers precision_limited.
+MAX_MAX_PX = 8000
+
+#: Longest side (px) used when the DXF header carries no real-world unit, so a
+#: metres-per-pixel target is meaningless — a plain reasonable default.
+UNITLESS_MAX_PX = 2000
 
 
 @dataclass(frozen=True)
 class DxfDrawing:
     """The result of rendering a DXF: the raster plus the metadata needed to offer
-    a header-units scale candidate and to sanity-check what was drawn."""
+    a header-units scale candidate, judge render precision, and sanity-check what
+    was drawn."""
 
     raster: RasterImage
     insunits: int
@@ -52,6 +82,9 @@ class DxfDrawing:
     bbox: tuple[float, float, float, float]  # (min_x, min_y, max_x, max_y), drawing units
     entity_count: int                      # drawable entities actually rendered
     skipped_entity_types: tuple[str, ...]  # present but not rendered (flagged)
+    metres_per_pixel: float | None         # real-world m/px (None if unitless header)
+    precision_target_m: float              # the m/px we aimed for
+    precision_limited: bool                # True: extent too large to hit the target
 
 
 def read_dxf_header_units(path) -> int:
@@ -97,15 +130,39 @@ def _polylines_from_msp(msp):
     return polylines, skipped
 
 
-def render_dxf(path, *, max_px: int = DEFAULT_MAX_PX,
+def _metres_per_unit_or_none(insunits: int) -> float | None:
+    """metres-per-unit for a header code, or None when it carries no real unit."""
+    try:
+        return metres_per_unit_from_insunits(insunits)
+    except ValueError:
+        return None
+
+
+def _auto_max_px(extent_units: float, metres_per_unit: float | None, padding_px: int) -> int:
+    """Longest-side pixel count that hits :data:`TARGET_M_PER_PX` for this drawing's
+    real-world extent, clamped to [MIN_MAX_PX, MAX_MAX_PX]. Falls back to a fixed
+    default when the header has no real unit (no metres target possible)."""
+    if metres_per_unit is None:
+        return UNITLESS_MAX_PX
+    extent_m = extent_units * metres_per_unit
+    needed_inner = extent_m / TARGET_M_PER_PX          # pixels across the drawing
+    needed = ceil(needed_inner) + 2 * padding_px
+    return max(MIN_MAX_PX, min(MAX_MAX_PX, needed))
+
+
+def render_dxf(path, *, max_px: int | None = None,
                padding_px: int = DEFAULT_PADDING_PX) -> DxfDrawing:
     """Render a DXF's line/polyline entities to a RasterImage and return it with
-    the header unit and the render scale (drawing-units-per-pixel).
+    the header unit, the render scale (drawing-units-per-pixel), and a real-world
+    precision assessment.
 
-    The drawing is scaled uniformly (aspect preserved) to fit *max_px*, which is
-    what fixes drawing-units-per-pixel. Raises ``FileNotFoundError`` for a missing
-    file, ``ValueError`` for an unparseable DXF or one with no drawable line/
-    polyline geometry (nothing to place a boundary against).
+    Resolution is **extent-aware** by default (``max_px=None``): it is chosen so a
+    pixel spans about :data:`TARGET_M_PER_PX` of real distance, clamped to a
+    memory-sane ceiling. If the drawing is so large that even the ceiling can't
+    reach that precision, ``precision_limited`` is set (honest about coarseness
+    rather than hiding it). Pass an explicit *max_px* to force a specific longest
+    side. Raises ``FileNotFoundError`` for a missing file, ``ValueError`` for an
+    unparseable DXF or one with no drawable line/polyline geometry.
     """
     p = Path(path)
     if not p.is_file():
@@ -132,9 +189,19 @@ def render_dxf(path, *, max_px: int = DEFAULT_MAX_PX,
     if extent <= 0:
         raise ValueError("DXF entities have zero extent (all coincident); nothing to render")
 
+    metres_per_unit = _metres_per_unit_or_none(insunits)
+    if max_px is None:
+        max_px = _auto_max_px(extent, metres_per_unit, padding_px)
+    else:
+        max_px = int(max_px)
+
     inner = max(1, int(max_px) - 2 * int(padding_px))
     px_per_unit = inner / extent
     units_per_pixel = 1.0 / px_per_unit
+    metres_per_pixel = (metres_per_unit * units_per_pixel) if metres_per_unit is not None else None
+    # Coarser than the target = precision limited (huge extent at the ceiling, or a
+    # small forced max_px). Unknown-unit drawings can't be judged, so never flagged.
+    precision_limited = metres_per_pixel is not None and metres_per_pixel > TARGET_M_PER_PX
     img_w = max(1, round(width_u * px_per_unit)) + 2 * padding_px
     img_h = max(1, round(height_u * px_per_unit)) + 2 * padding_px
 
@@ -156,6 +223,9 @@ def render_dxf(path, *, max_px: int = DEFAULT_MAX_PX,
         bbox=(min_x, min_y, max_x, max_y),
         entity_count=len(polylines),
         skipped_entity_types=tuple(sorted(skipped)),
+        metres_per_pixel=metres_per_pixel,
+        precision_target_m=TARGET_M_PER_PX,
+        precision_limited=precision_limited,
     )
 
 
