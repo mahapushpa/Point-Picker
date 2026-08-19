@@ -165,3 +165,71 @@ def parcel_at_point(parcels, point: Point, tol: float = CLICK_TOLERANCE_PX):
 def parcels_in_rect(parcels, rect: Rect) -> list:
     """Ids of every parcel touching or within *rect*, preserving input order."""
     return [pid for pid, polygon in parcels if polygon_intersects_rect(polygon, rect)]
+
+
+# --- boundary-edge selection (Milestone 12) --------------------------------
+#
+# The segment-length report selects a CONTIGUOUS run of a parcel's boundary
+# edges. This logic is pure so the canvas stays a thin renderer: it maps a click
+# to the nearest edge (below) and asks these functions how the selection changes,
+# guaranteeing an unbroken arc by construction (the brief forbids a gap ever
+# existing, not merely detecting one afterwards).
+
+def point_segment_distance(p: Point, a: Point, b: Point) -> float:
+    """Distance from *p* to segment *a*-*b* (public wrapper over the internal
+    helper, so the canvas can hit-test edges in viewport pixels)."""
+    return _dist_point_to_segment(p, a, b)
+
+
+def nearest_edge_index(point: Point, edges, tol: float):
+    """Index of the edge (an ``(a, b)`` pair) nearest *point* within *tol*, else
+    None. *edges* is an ordered list of segments; ties keep the earliest."""
+    best, best_d = None, tol
+    for i, (a, b) in enumerate(edges):
+        d = _dist_point_to_segment(point, a, b)
+        if d <= best_d:
+            best_d = d
+            best = i
+    return best
+
+
+def contiguous_edge_toggle(selected, edge: int, n_edges: int, closed: bool) -> list:
+    """Toggle *edge* within an ordered contiguous run of edge indices, keeping the
+    result a single unbroken arc (never a gap). Returns the new ordered run.
+
+    Edges are numbered ``0..n_edges-1``; when *closed*, edge ``n_edges-1`` is
+    adjacent to edge ``0`` (the run may wrap). Rules:
+      * empty selection -> ``[edge]``;
+      * clicking the run's front/back endpoint removes it (shrinks the arc);
+      * clicking the lone remaining edge clears the selection;
+      * clicking any edge of a full closed loop drops it, leaving a contiguous arc;
+      * clicking an edge adjacent to either end extends the run there;
+      * anything else (a non-adjacent edge, or an interior edge whose removal would
+        split the run) is ignored — a disconnected selection can't be created.
+    """
+    s = list(selected)
+    if not (0 <= edge < n_edges):
+        return s
+    if not s:
+        return [edge]
+
+    if edge in s:
+        if len(s) == 1:
+            return []
+        if closed and len(s) == n_edges:
+            start = (edge + 1) % n_edges
+            return [(start + k) % n_edges for k in range(n_edges - 1)]
+        if edge == s[0]:
+            return s[1:]
+        if edge == s[-1]:
+            return s[:-1]
+        return s  # interior removal would split the arc -> no-op
+
+    front, back = s[0], s[-1]
+    prev_front = (front - 1) % n_edges if closed else front - 1
+    next_back = (back + 1) % n_edges if closed else back + 1
+    if edge == prev_front and (closed or front - 1 >= 0):
+        return [edge] + s
+    if edge == next_back and (closed or back + 1 < n_edges):
+        return s + [edge]
+    return s  # non-adjacent -> no-op (selection stays contiguous)

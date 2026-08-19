@@ -194,12 +194,26 @@ purpose:
 2. **Segment-length / boundary-description report — a separate, specific
    report type, not a byproduct of the summary.** Traditional boundary
    descriptions list each edge with direction and length (e.g. "North:
-   bounded by [X], 45 m"). The user should be able to **select which
-   segments to include** (not forced to include every edge) — e.g. only
-   boundary edges shared with a named neighboring feature, excluding
-   internal/construction lines. This needs its own export path, since its
-   structure (one row per selected segment) differs from the parcel-summary
-   structure (one row per parcel).
+   bounded by [X], 45 m"). Selection happens **on the canvas** (click an
+   edge to toggle it, visible color change) — spatial context is what
+   catches something looking wrong, which a checkbox list can't offer.
+   Selection is **contiguous only**: the whole loop, or one unbroken arc
+   of it — the UI should make a disconnected/skipped selection impossible
+   to create in the first place, rather than allowing it and then
+   detecting the gap, since a traced polygon's own edges are inherently
+   one continuous loop and a boundary description only makes sense as a
+   contiguous run. A side table builds up as segments are selected —
+   vertex info + length in real units only (never raw pixels) — and this
+   table **is** the report content, not just a selection aid; it feeds
+   directly into the exported document. Lengths are always shown in real
+   units, per the Scale-first rule. This needs its own export path, since
+   its structure (one row per selected segment) differs from the M11
+   parcel-summary structure (one row per parcel).
+
+   **Related, more general capability worth building alongside this**:
+   hover/click on any traced edge (any time, not just during report
+   building) to see its length — a quick sanity-check tool independent of
+   report generation.
 3. **Visual confidence overlay.** Before trusting a report, the user should
    be able to see the traced boundary drawn directly over the source scan,
    selectable/toggleable per parcel, so overlap/misalignment is visible at
@@ -319,6 +333,15 @@ those reference points varies by survey age:
    weak reference, say so explicitly.
 
 ## Data quality / noise handling
+**Considered and deliberately deferred: OCR auto-extraction of
+identification fields from the sheet.** Raised as a "would be helpful, but
+skip it if it adds real weight" idea. Scanned revenue documents mixing
+scripts/languages and handwriting make OCR genuinely unreliable here, and
+a silently wrong auto-filled Khasra number is worse than an empty field a
+person fills in manually — manual entry (M10) already works cleanly. Not
+in scope; documented so it isn't proposed again without a concrete need
+that changes this calculus.
+
 Two distinct pieces, different risk profiles:
 
 1. **Image preprocessing** (denoise/contrast enhancement on the scan before
@@ -327,14 +350,22 @@ Two distinct pieces, different risk profiles:
    is also a prerequisite for decent results from the tracing-assist
    feature below. Worth doing early since it's a broadly useful, low-risk
    improvement.
-2. **Point-data guard rails** — flag likely-accidental input (e.g. a new
-   point placed implausibly close to the previous one, suggesting a
-   double-click) at the moment of placement. This is deliberately a
-   **warning, not automated correction**: the source project's own hard
-   lessons (see below) already showed that automated "is this point a real
-   corner or noise" judgment is unreliable — a simple flag the user can
-   dismiss or act on is the right level of automation here, not a silent
-   fix.
+2. **Point-data guard rails** — two related but distinct checks, both
+   warnings, never automated correction:
+   - Likely-accidental duplicate: a new point placed implausibly close to
+     the previous one (a probable double-click).
+   - Likely-missing corner: an edge that's suspiciously long/straight
+     compared to what the underlying scan shows, which may mean a real
+     bend point was overlooked during tracing — this affects area
+     correctness, not just report presentation, so it's worth catching,
+     but it belongs with vertex placement/tracing, not with any report
+     (segment-selection in the boundary-description report, M12, is a
+     separate concern and does not attempt this check).
+   This is deliberately a **warning, not automated correction** either
+   way: the source project's own hard lessons (see below) already showed
+   that automated "is this point a real corner or noise" judgment is
+   unreliable — a simple flag the user can dismiss or act on is the right
+   level of automation here, not a silent fix.
 
 ## Semi-automated tracing assist (boundary line-following)
 User marks two points on a printed/drawn boundary line; the tool follows

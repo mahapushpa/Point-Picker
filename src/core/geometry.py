@@ -18,7 +18,7 @@ Conventions:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import hypot
+from math import atan2, degrees, hypot
 
 Point = tuple[float, float]
 
@@ -26,6 +26,38 @@ Point = tuple[float, float]
 def segment_length(a: Point, b: Point) -> float:
     """Euclidean pixel distance between two points."""
     return hypot(b[0] - a[0], b[1] - a[1])
+
+
+# --- direction / bearing (Milestone 12: boundary-description report) --------
+#
+# Convention (chosen for un-georeferenced survey scans, which are conventionally
+# drawn North-up): screen "up" — decreasing image y — is North, and bearings
+# increase clockwise, 0..360 with 0 = North, 90 = East, 180 = South, 270 = West.
+# This is plain 2-D geometry from the traced vertex coordinates; it is NOT the
+# georeferenced bearing of M16's location-fixing (which resolves true North from
+# real-world reference points) and does not depend on it. Bearing is
+# scale-invariant, so it needs no scale — only the *length* half of the report
+# does (Scale-first rule).
+
+#: Full-word 8-point compass labels used in the traditional boundary description.
+_COMPASS_8 = ("North", "North-east", "East", "South-east",
+              "South", "South-west", "West", "North-west")
+
+
+def bearing_deg(a: Point, b: Point) -> float:
+    """Compass bearing from *a* to *b* in degrees, North-up / clockwise (see the
+    convention note above). Returns 0.0 for a zero-length (degenerate) edge."""
+    dx = b[0] - a[0]
+    dy = b[1] - a[1]
+    if dx == 0 and dy == 0:
+        return 0.0
+    # North component is -dy (image y points down); East component is dx.
+    return degrees(atan2(dx, -dy)) % 360.0
+
+
+def compass_label(bearing: float) -> str:
+    """Nearest 8-point compass label ('North', 'North-east', ...) for a bearing."""
+    return _COMPASS_8[int(bearing / 45.0 + 0.5) % 8]
 
 
 def segment_lengths(points: list[Point]) -> list[float]:

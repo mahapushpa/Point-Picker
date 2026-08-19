@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.polygon import nearest_vertex_index, SNAP_TOLERANCE_PX
+from ..core.selection import nearest_edge_index, contiguous_edge_toggle
 from ..io.raster import RasterImage
 
 _MARK_COLOR = QColor("#1D9E75")  # scale-calibration markers: accent green (as point_picker.html)
@@ -45,6 +46,8 @@ _ACTIVE_HALO = QColor("#FFFFFF")  # ring around the currently-selected point
 _SNAP_COLOR = QColor("#D6336C")   # snap indicator: magenta, "about to reuse this vertex"
 _MARQUEE_COLOR = QColor("#0B7285")  # rubber-band selection rectangle
 _SELECTED_FILL_ALPHA = 70         # translucent fill marking a selected (not active) parcel
+_SEG_COLOR = QColor("#7048E8")    # selected boundary segment (M12): violet, distinct from all above
+_SEG_HOVER_COLOR = QColor("#B197FC")  # edge under the cursor in segment mode (faint violet)
 
 
 def qimage_from_raster(raster: RasterImage) -> QImage:
@@ -90,6 +93,12 @@ class CanvasView(QGraphicsView):
     #: Emitted (min_x, min_y, max_x, max_y in scene coords) when a marquee drag
     #: finishes in selection mode.
     marqueeSelected = Signal(float, float, float, float)
+    #: Emitted when the boundary-segment selection changes (M12), so the window
+    #: rebuilds its side table from :meth:`selected_segment_edges`.
+    segmentSelectionChanged = Signal()
+    #: Emitted with the edge index under the cursor in segment mode (-1 when none),
+    #: for the live "hover an edge to see its length" readout.
+    edgeHovered = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -140,6 +149,15 @@ class CanvasView(QGraphicsView):
         self._sel_origin_scene: QPointF | None = None
         self._marquee_item: QGraphicsItem | None = None
 
+        # Boundary-segment selection (Milestone 12) — pick a contiguous run of the
+        # ACTIVE parcel's edges for the boundary-description report. Selection is
+        # an ordered edge-index list kept contiguous by construction.
+        self._segmenting = False
+        self._seg_selected: list[int] = []
+        self._seg_items: list[QGraphicsItem] = []
+        self._seg_hover_edge: int | None = None
+        self.EDGE_HIT_RADIUS = 8   # px around an edge that counts as clicking it
+
         # Precision crosshair.
         self._crosshair_enabled = False
         self._cursor_vp_pos = None  # QPoint in viewport coords, or None
@@ -172,6 +190,10 @@ class CanvasView(QGraphicsView):
         self._selected_ids.clear()
         self._sel_dragging = False
         self._marquee_item = None
+        self._segmenting = False
+        self._seg_selected.clear()
+        self._seg_items.clear()
+        self._seg_hover_edge = None
         self._active = None
         self._drag_kind = self._drag_index = None
         self._pixmap_item = self._scene.addPixmap(pixmap)
@@ -221,6 +243,8 @@ class CanvasView(QGraphicsView):
             return False
         self._reset_polygon_mode()          # modes are mutually exclusive
         self._reset_selection_mode()
+        self._reset_segment_mode()
+        self._redraw_segments()
         self.clear_scale_markers()
         self._calibrating = True
         self._crosshair_enabled = True       # crosshair on by default for scale
@@ -254,6 +278,8 @@ class CanvasView(QGraphicsView):
             return False
         self._reset_calibration_mode()       # modes are mutually exclusive
         self._reset_selection_mode()
+        self._reset_segment_mode()
+        self._redraw_segments()
         if self._poly_closed:
             self._poly_closed = False        # re-open to continue editing
         self._tracing = True
@@ -318,7 +344,12 @@ class CanvasView(QGraphicsView):
         self._poly_closed = closed and len(self._poly_points) >= 3
         self._tracing = False
         self._active = None
+        # A different active boundary invalidates any segment selection (edge
+        # indices are per-parcel); drop it silently (the caller is loading).
+        self._seg_selected.clear()
+        self._seg_hover_edge = None
         self._redraw_polygon()
+        self._redraw_segments()
         self._update_cursor()
 
     def set_active_vertex_ids(self, vertex_ids) -> None:
@@ -425,6 +456,131 @@ class CanvasView(QGraphicsView):
                 self._scene.addItem(text)
                 self._bg_items.append(text)
 
+    # -- boundary-segment selection (Milestone 12) --------------------------
+    #
+    # A view operation on the ACTIVE parcel: click an edge to add/remove it from a
+    # contiguous run (colour change), for the boundary-description report. Edge i
+    # is between active point i and i+1 (the closing edge, index n-1, joins the
+    # last point back to the first when the boundary is closed) — the same edge
+    # numbering the export uses, so indices line up end-to-end.
+
+    def start_segment_selection(self) -> bool:
+        """Enter segment-selection mode on the active boundary. Returns False if
+        there is no image or the active parcel has no edges to select."""
+        if self._pixmap_item is None or len(self._edge_list()) == 0:
+            return False
+        self._reset_calibration_mode()
+        self._reset_polygon_mode()
+        self._reset_selection_mode()
+        self._clear_snap_indicator()
+        self._segmenting = True
+        self.setFocus()
+        self._redraw_segments()
+        self._update_cursor()
+        return True
+
+    def stop_segment_selection(self) -> None:
+        self._segmenting = False
+        self._seg_hover_edge = None
+        self._redraw_segments()
+        self._update_cursor()
+        self.edgeHovered.emit(-1)
+
+    def is_segment_selecting(self) -> bool:
+        return self._segmenting
+
+    def clear_segment_selection(self) -> None:
+        if self._seg_selected:
+            self._seg_selected.clear()
+            self._redraw_segments()
+            self.segmentSelectionChanged.emit()
+
+    def selected_segment_edges(self) -> list[int]:
+        """The current ordered, contiguous run of selected edge indices."""
+        return list(self._seg_selected)
+
+    def set_segment_selection(self, edges) -> None:
+        """Set the selected edge run programmatically (restore, or drive from a
+        test), then redraw and notify. Indices must refer to the active boundary."""
+        self._seg_selected = [int(e) for e in edges]
+        self._redraw_segments()
+        self.segmentSelectionChanged.emit()
+
+    def _reset_segment_mode(self) -> None:
+        """Leave segment interaction; keep the selection so a re-entry resumes it."""
+        self._segmenting = False
+        self._seg_hover_edge = None
+
+    def _edge_list(self):
+        """The active boundary's edges as ``(edge_index, a, b)`` with QPointF
+        endpoints, including the closing edge when closed. Matches the export's
+        edge numbering."""
+        pts = self._poly_points
+        edges = [(i, pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+        if self._poly_closed and len(pts) >= 3:
+            edges.append((len(pts) - 1, pts[-1], pts[0]))
+        return edges
+
+    def _edge_at(self, view_pos: QPointF):
+        """Index of the active-boundary edge under *view_pos* (viewport coords)
+        within EDGE_HIT_RADIUS, else None. Hit-tested in viewport pixels so the
+        tolerance is constant at any zoom."""
+        edges = self._edge_list()
+        if not edges:
+            return None
+        segs = []
+        for _idx, a, b in edges:
+            va, vb = self.mapFromScene(a), self.mapFromScene(b)
+            segs.append(((va.x(), va.y()), (vb.x(), vb.y())))
+        pos = (view_pos.x(), view_pos.y())
+        local = nearest_edge_index(pos, segs, self.EDGE_HIT_RADIUS)
+        return edges[local][0] if local is not None else None
+
+    def _toggle_edge_at(self, view_pos: QPointF) -> None:
+        edge = self._edge_at(view_pos)
+        if edge is None:
+            return
+        n_edges = len(self._edge_list())
+        self._seg_selected = contiguous_edge_toggle(
+            self._seg_selected, edge, n_edges, self._poly_closed)
+        self._redraw_segments()
+        self.segmentSelectionChanged.emit()
+
+    def _redraw_segments(self) -> None:
+        self._remove_items(self._seg_items)
+        if not self._segmenting:
+            return
+        by_index = {i: (a, b) for i, a, b in self._edge_list()}
+        # Hovered (not-yet-selected) edge: a faint highlight cue.
+        if self._seg_hover_edge is not None and self._seg_hover_edge not in self._seg_selected \
+                and self._seg_hover_edge in by_index:
+            a, b = by_index[self._seg_hover_edge]
+            self._add_segment_line(a, b, _SEG_HOVER_COLOR, width=5)
+        # Selected edges: bold highlight + running sequence number.
+        for seq, idx in enumerate(self._seg_selected, 1):
+            if idx not in by_index:
+                continue
+            a, b = by_index[idx]
+            self._add_segment_line(a, b, _SEG_COLOR, width=5)
+            mid = QPointF((a.x() + b.x()) / 2, (a.y() + b.y()) / 2)
+            label = QGraphicsSimpleTextItem(str(seq))
+            label.setBrush(_SEG_COLOR)
+            label.setPos(mid)
+            label.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+            label.setZValue(8)
+            self._scene.addItem(label)
+            self._seg_items.append(label)
+
+    def _add_segment_line(self, a: QPointF, b: QPointF, color: QColor, width: int) -> None:
+        pen = QPen(color)
+        pen.setWidth(width)
+        pen.setCosmetic(True)
+        line = QGraphicsLineItem(a.x(), a.y(), b.x(), b.y())
+        line.setPen(pen)
+        line.setZValue(7)   # above the active boundary (5), below markers (10)
+        self._scene.addItem(line)
+        self._seg_items.append(line)
+
     # -- shared pick: confirm / cancel / crosshair --------------------------
 
     def confirm_pick(self) -> bool:
@@ -482,6 +638,8 @@ class CanvasView(QGraphicsView):
             return False
         self._reset_calibration_mode()   # drop an in-progress calibration
         self._reset_polygon_mode()       # stop tracing, keep the polygon
+        self._reset_segment_mode()
+        self._redraw_segments()
         self._clear_snap_indicator()
         self._selecting = True
         self.setFocus()
@@ -612,6 +770,15 @@ class CanvasView(QGraphicsView):
         if self._tracing and not self._mouse_down:
             self._update_snap_indicator(self.mapToScene(pos.toPoint()))
 
+        # Free hover in segment mode: highlight the edge under the cursor and
+        # report it (drives the live "hover an edge to see its length" readout).
+        if self._segmenting and not self._mouse_down:
+            edge = self._edge_at(pos)
+            if edge != self._seg_hover_edge:
+                self._seg_hover_edge = edge
+                self._redraw_segments()
+                self.edgeHovered.emit(-1 if edge is None else edge)
+
         if self._mouse_down and self._last_pan_pos is not None:
             if not self._moved and (pos - self._press_pos).manhattanLength() > self.CLICK_MOVE_THRESHOLD:
                 self._moved = True
@@ -654,7 +821,10 @@ class CanvasView(QGraphicsView):
                 was_click = not self._moved
                 self._update_cursor()
                 if was_click:
-                    self._place_point(self.mapToScene(event.position().toPoint()))
+                    if self._segmenting:
+                        self._toggle_edge_at(event.position())
+                    else:
+                        self._place_point(self.mapToScene(event.position().toPoint()))
                 event.accept()
                 return
         super().mouseReleaseEvent(event)
@@ -970,7 +1140,7 @@ class CanvasView(QGraphicsView):
             # Hide the OS cursor when the drawn crosshair is showing, else a cross.
             self.setCursor(Qt.CursorShape.BlankCursor if self._crosshair_enabled
                            else Qt.CursorShape.CrossCursor)
-        elif self._selecting:
+        elif self._selecting or self._segmenting:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
         else:
             self.setCursor(Qt.CursorShape.OpenHandCursor)

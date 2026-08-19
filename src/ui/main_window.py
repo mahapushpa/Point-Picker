@@ -26,9 +26,11 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDockWidget, QFileDialog, QHBoxLayout, QInputDialog,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPushButton, QToolBar, QVBoxLayout, QWidget,
+    QApplication, QAbstractItemView, QCheckBox, QComboBox, QDialog,
+    QDialogButtonBox, QDockWidget, QFileDialog, QHBoxLayout, QHeaderView,
+    QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+    QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QToolBar,
+    QVBoxLayout, QWidget,
 )
 
 from ..core.geometry import measure_polygon
@@ -37,6 +39,7 @@ from ..core.scale import compute_two_point_scale, TwoPointScale
 from ..core.selection import parcel_at_point, parcels_in_rect
 from ..core import units
 from ..export import report as report_export
+from ..export import segment_report as segment_export
 from ..io.raster import open_raster
 from ..io.preprocess import preprocess_raster
 from .canvas_view import CanvasView
@@ -79,6 +82,8 @@ class MainWindow(QMainWindow):
         self.canvas.vertexMoved.connect(self._on_vertex_moved)
         self.canvas.selectionClicked.connect(self._on_selection_clicked)
         self.canvas.marqueeSelected.connect(self._on_marquee_selected)
+        self.canvas.segmentSelectionChanged.connect(self._on_segment_selection_changed)
+        self.canvas.edgeHovered.connect(self._on_edge_hovered)
 
         # Session state.
         self._project: ProjectDB | None = None
@@ -91,6 +96,15 @@ class MainWindow(QMainWindow):
         # Session-only (a scratch working set): never persisted, cleared on
         # opening a project / loading another file.
         self._selected_parcel_ids: set[int] = set()
+
+        # Boundary-segment report (Milestone 12): the live side table's contents
+        # for the active parcel. `_segment_edges` is every candidate edge (from the
+        # export module, so the numbering matches); `_segment_neighbours` holds the
+        # user's per-edge neighbouring-feature text keyed by edge index — this table
+        # *is* the report content, not a separate model.
+        self._segment_edges: list = []
+        self._segment_context: dict = {}
+        self._segment_neighbours: dict[int, str] = {}
 
         # Image preprocessing (M8): a display-time, non-destructive preview. The
         # raw raster and the source file are never modified; the enhanced raster
@@ -113,6 +127,7 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._build_units_toolbar()
         self._build_parcel_dock()
+        self._build_segment_dock()
 
     # -- construction -------------------------------------------------------
 
@@ -247,6 +262,59 @@ class MainWindow(QMainWindow):
         self._parcel_dock = dock
         self._refresh_parcel_controls_enabled()
 
+    # -- boundary-segment report dock (Milestone 12) ------------------------
+
+    _SEG_COLS = ("Seq", "From", "To", "Length", "Bearing", "Neighbour")
+    _SEG_NEIGHBOUR_COL = 5
+
+    def _build_segment_dock(self) -> None:
+        """Right-side dock (same pattern as Parcels) that fills live as boundary
+        edges are picked on the canvas: one row per selected segment plus a running
+        total. Editing the Neighbour cell here is what feeds the exported
+        'North: bounded by [X], 45 m' line — same data, no separate model."""
+        dock = QDockWidget("Boundary segments", self)
+        dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea |
+                             Qt.DockWidgetArea.RightDockWidgetArea)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        self._segment_hint = QLabel(
+            "Pick a parcel, then ‘Describe boundary’ — click edges on the canvas "
+            "to build a contiguous run.")
+        self._segment_hint.setWordWrap(True)
+        layout.addWidget(self._segment_hint)
+
+        self._segment_table = QTableWidget(0, len(self._SEG_COLS))
+        self._segment_table.setHorizontalHeaderLabels(self._SEG_COLS)
+        self._segment_table.verticalHeader().setVisible(False)
+        self._segment_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked |
+            QAbstractItemView.EditTrigger.SelectedClicked)
+        self._segment_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self._segment_table.horizontalHeader().setSectionResizeMode(
+            self._SEG_NEIGHBOUR_COL, QHeaderView.ResizeMode.Stretch)
+        self._segment_table.itemChanged.connect(self._on_segment_neighbour_edited)
+        layout.addWidget(self._segment_table, 1)
+
+        self._segment_total_label = QLabel("Total selected: —")
+        layout.addWidget(self._segment_total_label)
+
+        buttons = QHBoxLayout()
+        self._segment_clear_btn = QPushButton("Clear")
+        self._segment_clear_btn.clicked.connect(self._clear_segment_selection)
+        self._segment_generate_btn = QPushButton("Generate report…")
+        self._segment_generate_btn.clicked.connect(self.generate_segment_report)
+        buttons.addWidget(self._segment_clear_btn)
+        buttons.addWidget(self._segment_generate_btn)
+        layout.addLayout(buttons)
+
+        dock.setWidget(body)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self._segment_dock = dock
+        self._segment_generate_btn.setEnabled(False)
+        self._segment_clear_btn.setEnabled(False)
+
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
         new_proj = QAction("&New Project…", self)
@@ -317,6 +385,12 @@ class MainWindow(QMainWindow):
             "(PDF / CSV / JSON)")
         owner_report_act.triggered.connect(self.export_owner_report)
         reports_menu.addAction(owner_report_act)
+        boundary_report_act = QAction("&Boundary description (segments)…", self)
+        boundary_report_act.setToolTip(
+            "Describe a parcel's boundary edge-by-edge: pick a contiguous run of "
+            "edges on the canvas, then export (PDF / CSV / JSON)")
+        boundary_report_act.triggered.connect(self.begin_segment_description)
+        reports_menu.addAction(boundary_report_act)
 
         select_menu = self.menuBar().addMenu("Se&lection")
         select_act = QAction("&Select parcels (click / marquee)", self)
@@ -344,6 +418,14 @@ class MainWindow(QMainWindow):
         clear_poly_act = QAction("C&lear boundary", self)
         clear_poly_act.triggered.connect(self.clear_polygon)
         poly_menu.addAction(clear_poly_act)
+        poly_menu.addSeparator()
+        self._segment_action = QAction("&Describe boundary (select segments)", self,
+                                       checkable=True)
+        self._segment_action.setToolTip(
+            "Click boundary edges of the active parcel to build a contiguous run, "
+            "then generate a boundary-description report")
+        self._segment_action.toggled.connect(self._on_segment_toggled)
+        poly_menu.addAction(self._segment_action)
 
     # -- projects -----------------------------------------------------------
 
@@ -473,6 +555,11 @@ class MainWindow(QMainWindow):
             self._owner_edit.blockSignals(True)
             self._owner_edit.setText("")
             self._owner_edit.blockSignals(False)
+            if self._segment_action.isChecked():   # nothing to describe now
+                self._set_segment_checked(False)
+                self.canvas.stop_segment_selection()
+                self._segment_edges = []
+                self._refresh_segment_table()
             self._update_measure_readout()
             return
 
@@ -495,6 +582,14 @@ class MainWindow(QMainWindow):
             self._parcel_list.blockSignals(True)
             self._parcel_list.setCurrentRow(index)
             self._parcel_list.blockSignals(False)
+        # In segment mode, re-point the side table at the new parcel's edges (the
+        # canvas already cleared the now-invalid selection in set_polygon).
+        if self._segment_action.isChecked():
+            try:
+                self._load_segment_edges()
+            except segment_export.SegmentReportError:
+                self._segment_edges, self._segment_context = [], {}
+            self._refresh_segment_table()
         self._update_measure_readout()
 
     def _refresh_backgrounds(self) -> None:
@@ -586,6 +681,7 @@ class MainWindow(QMainWindow):
                 self._set_select_checked(False)
                 QMessageBox.information(self, "No document", "Open a PDF or image first.")
                 return
+            self._set_segment_checked(False)
             self._sync_crosshair_action()
             self._status.setText(
                 "Select mode: click a parcel to toggle it, drag to select several. "
@@ -771,6 +867,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No document", "Open a PDF or image first.")
             return
         self._set_select_checked(False)   # canvas already left selection mode
+        self._set_segment_checked(False)
         self._sync_crosshair_action()
         self._status.setText(
             "Set scale: click two points a known distance apart; drag or arrow-keys "
@@ -816,6 +913,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No document", "Open a PDF or image first.")
             return
         self._set_select_checked(False)   # canvas already left selection mode
+        self._set_segment_checked(False)
         self._sync_crosshair_action()
         hint = ("Trace boundary: click to add points; drag or arrow-keys to fine-tune; "
                 "Enter (or 'Close') to finish, Esc to cancel.")
@@ -991,6 +1089,198 @@ class MainWindow(QMainWindow):
             self._owner_edit.blockSignals(True)
             self._owner_edit.setText((parcel.get("owner") or "") if parcel else "")
             self._owner_edit.blockSignals(False)
+
+    # -- boundary-segment report (Milestone 12) -----------------------------
+
+    def begin_segment_description(self) -> None:
+        """Menu/programmatic entry: latch the checkable toggle (drives
+        :meth:`_on_segment_toggled`)."""
+        if self._segment_action.isChecked():
+            self._on_segment_toggled(True)
+        else:
+            self._segment_action.setChecked(True)
+
+    def _set_segment_checked(self, on: bool) -> None:
+        self._segment_action.blockSignals(True)
+        self._segment_action.setChecked(on)
+        self._segment_action.blockSignals(False)
+
+    def _on_segment_toggled(self, checked: bool) -> None:
+        """Enter/leave boundary-segment selection on the active parcel. Scale-first:
+        a boundary description needs real lengths, so a parcel with no scale is
+        blocked here rather than producing a fabricated number."""
+        if not checked:
+            if self.canvas.is_segment_selecting():
+                self.canvas.stop_segment_selection()
+            self._status.setText("Boundary-description mode off.")
+            return
+
+        if self._project is None or self._active_parcel_id is None:
+            self._set_segment_checked(False)
+            QMessageBox.information(
+                self, "No parcel",
+                "Select a parcel first — a boundary description is per parcel.")
+            return
+        if self._project.get_source_scale(self._source_id) is None:
+            self._set_segment_checked(False)
+            QMessageBox.information(
+                self, "No scale set",
+                "Set a scale for this source first — a boundary description reports "
+                "real segment lengths, which need a scale (Scale-first rule).")
+            return
+        try:
+            self._load_segment_edges()
+        except segment_export.SegmentReportError as exc:
+            self._set_segment_checked(False)
+            QMessageBox.information(self, "No boundary", str(exc))
+            return
+        if not self.canvas.start_segment_selection():
+            self._set_segment_checked(False)
+            QMessageBox.information(
+                self, "No boundary",
+                "This parcel has no boundary edges to describe yet.")
+            return
+        self._set_select_checked(False)
+        self._sync_crosshair_action()
+        self._refresh_segment_table()
+        self._status.setText(
+            "Describe boundary: click edges of the active parcel to build a "
+            "contiguous run; type each neighbour in the side table; then Generate.")
+
+    def _load_segment_edges(self) -> None:
+        """Pull the active parcel's candidate edges (numbering matches the export)
+        and reset the per-edge neighbour text."""
+        self._segment_edges, self._segment_context = segment_export.list_parcel_edges(
+            self._project, self._active_parcel_id)
+        self._segment_neighbours = {}
+
+    def _on_segment_selection_changed(self) -> None:
+        self._refresh_segment_table()
+
+    def _refresh_segment_table(self) -> None:
+        """Rebuild the side table from the canvas's selected edge run, preserving
+        any neighbour text already typed. This table's rows ARE the report."""
+        selected = self.canvas.selected_segment_edges()
+        by_index = {e.edge_index: e for e in self._segment_edges}
+        self._segment_row_edges = list(selected)
+
+        table = self._segment_table
+        table.blockSignals(True)         # our own edits shouldn't fire itemChanged
+        table.setRowCount(len(selected))
+        total_m = 0.0
+        for row, idx in enumerate(selected):
+            edge = by_index.get(idx)
+            if edge is None:
+                continue
+            length = edge.length_m
+            total_m += length or 0.0
+            values = [
+                str(row + 1),
+                edge.vertex_a_label,
+                edge.vertex_b_label,
+                "—" if length is None else f"{length:.2f} m",
+                f"{edge.bearing_deg:.0f}° {edge.compass}",
+            ]
+            for col, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled)   # read-only
+                table.setItem(row, col, item)
+            neighbour = QTableWidgetItem(self._segment_neighbours.get(idx, ""))
+            neighbour.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsEditable)
+            table.setItem(row, self._SEG_NEIGHBOUR_COL, neighbour)
+        table.blockSignals(False)
+
+        if selected:
+            total_ft = total_m / 0.3048
+            self._segment_total_label.setText(
+                f"Total selected ({len(selected)} seg): {total_m:.2f} m ({total_ft:.1f} ft)")
+        else:
+            self._segment_total_label.setText("Total selected: —")
+        self._segment_generate_btn.setEnabled(bool(selected))
+        self._segment_clear_btn.setEnabled(bool(selected))
+
+    def _on_segment_neighbour_edited(self, item) -> None:
+        if item.column() != self._SEG_NEIGHBOUR_COL:
+            return
+        row = item.row()
+        if 0 <= row < len(getattr(self, "_segment_row_edges", [])):
+            self._segment_neighbours[self._segment_row_edges[row]] = item.text().strip()
+
+    def _on_edge_hovered(self, edge_index: int) -> None:
+        """Live 'hover an edge to see its length' readout (a general sanity tool)."""
+        if edge_index < 0:
+            return
+        for edge in self._segment_edges:
+            if edge.edge_index == edge_index:
+                length = ("no scale" if edge.length_m is None
+                          else f"{edge.length_m:.2f} m")
+                self._status.setText(
+                    f"Edge {edge.vertex_a_label}→{edge.vertex_b_label}: {length}, "
+                    f"{edge.bearing_deg:.0f}° {edge.compass}")
+                return
+
+    def _clear_segment_selection(self) -> None:
+        self.canvas.clear_segment_selection()   # emits change -> table refreshes
+
+    def generate_segment_report(self, formats=None) -> None:
+        """Export the boundary-description report for the current selection."""
+        if self._project is None or self._active_parcel_id is None:
+            return
+        edge_indices = self.canvas.selected_segment_edges()
+        if not edge_indices:
+            QMessageBox.information(
+                self, "No segments",
+                "Select at least one boundary edge on the canvas first.")
+            return
+        if formats is None:
+            formats = self._ask_report_formats()
+            if formats is None:
+                return
+        try:
+            report, paths = segment_export.export_segment_report(
+                self._project, self._active_parcel_id, self._project.exports_dir,
+                edge_indices=list(edge_indices), neighbours=dict(self._segment_neighbours),
+                formats=formats)
+        except (segment_export.SegmentReportError, ValueError) as exc:
+            QMessageBox.warning(self, "Could not generate", str(exc))
+            return
+        except Exception as exc:   # e.g. PyMuPDF missing for PDF
+            QMessageBox.warning(self, "Export failed", str(exc))
+            return
+        names = "\n".join(f"  • {p.name}" for p in paths)
+        QMessageBox.information(
+            self, "Boundary description generated",
+            f"{report.segment_count} segment(s), total {report.total_length_m:.2f} m, "
+            f"written to {self._project.exports_dir}:\n{names}")
+        self._status.setText(
+            f"Generated boundary description → {len(paths)} file(s) in exports/")
+
+    def _ask_report_formats(self):
+        """Small PDF-default / CSV-JSON-optional chooser (matches the M11 policy).
+        Returns the chosen formats, or None if cancelled."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Generate boundary description")
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel("Formats (written to the project's exports/ folder):"))
+        layout.addWidget(QLabel("PDF (primary) — always generated."))
+        csv = QCheckBox("Also write CSV")
+        js = QCheckBox("Also write JSON")
+        layout.addWidget(csv)
+        layout.addWidget(js)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Generate")
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if not dlg.exec():
+            return None
+        formats = ["pdf"]
+        if csv.isChecked():
+            formats.append("csv")
+        if js.isChecked():
+            formats.append("json")
+        return formats
 
     # -- reports (Milestone 11) ---------------------------------------------
 

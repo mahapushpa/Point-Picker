@@ -11,6 +11,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from src.core.selection import (
     point_in_polygon, point_hits_parcel, polygon_intersects_rect,
     parcel_at_point, parcels_in_rect, dist_point_to_polygon, CLICK_TOLERANCE_PX,
+    nearest_edge_index, contiguous_edge_toggle,
 )
 
 # A 100x100 square parcel with corner at the origin.
@@ -98,6 +99,64 @@ class ParcelLookupTests(unittest.TestCase):
         parcels = self._parcels()
         self.assertEqual(parcels_in_rect(parcels, (-10, -10, 700, 700)), [1, 2])
         self.assertEqual(parcels_in_rect(parcels, (-10, -10, 120, 120)), [1])
+
+
+class NearestEdgeTests(unittest.TestCase):
+    # Square edges: 0 top, 1 right, 2 bottom, 3 left (closing).
+    EDGES = [((0, 0), (100, 0)), ((100, 0), (100, 100)),
+             ((100, 100), (0, 100)), ((0, 100), (0, 0))]
+
+    def test_picks_nearest_edge_within_tolerance(self):
+        self.assertEqual(nearest_edge_index((50, 1), self.EDGES, 8), 0)   # near top
+        self.assertEqual(nearest_edge_index((99, 50), self.EDGES, 8), 1)  # near right
+
+    def test_none_when_out_of_tolerance(self):
+        self.assertIsNone(nearest_edge_index((50, 50), self.EDGES, 8))
+
+
+class ContiguousEdgeToggleTests(unittest.TestCase):
+    N = 4   # a closed square: edges 0,1,2,3 forming a cycle
+
+    def test_first_click_starts_selection(self):
+        self.assertEqual(contiguous_edge_toggle([], 2, self.N, closed=True), [2])
+
+    def test_extend_at_either_end(self):
+        self.assertEqual(contiguous_edge_toggle([1], 2, self.N, closed=True), [1, 2])
+        self.assertEqual(contiguous_edge_toggle([1], 0, self.N, closed=True), [0, 1])
+
+    def test_wrap_adjacency_when_closed(self):
+        # Front is 0, so its previous (wrapping) neighbour is edge 3.
+        self.assertEqual(contiguous_edge_toggle([0, 1], 3, self.N, closed=True), [3, 0, 1])
+
+    def test_no_wrap_when_open(self):
+        # Open path: edge 0 has no wrapping predecessor, so clicking 3 is a no-op.
+        self.assertEqual(contiguous_edge_toggle([0, 1], 3, self.N, closed=False), [0, 1])
+
+    def test_non_adjacent_click_is_ignored(self):
+        self.assertEqual(contiguous_edge_toggle([0], 2, self.N, closed=True), [0])
+
+    def test_remove_from_an_end(self):
+        self.assertEqual(contiguous_edge_toggle([0, 1, 2], 0, self.N, closed=True), [1, 2])
+        self.assertEqual(contiguous_edge_toggle([0, 1, 2], 2, self.N, closed=True), [0, 1])
+
+    def test_interior_removal_would_split_so_ignored(self):
+        self.assertEqual(contiguous_edge_toggle([0, 1, 2], 1, self.N, closed=True), [0, 1, 2])
+
+    def test_removing_the_only_edge_clears(self):
+        self.assertEqual(contiguous_edge_toggle([2], 2, self.N, closed=True), [])
+
+    def test_full_loop_removal_leaves_contiguous_arc(self):
+        # Whole closed loop selected; removing edge 1 leaves the arc 2,3,0.
+        self.assertEqual(contiguous_edge_toggle([0, 1, 2, 3], 1, self.N, closed=True),
+                         [2, 3, 0])
+
+    def test_selection_never_has_a_gap(self):
+        # Drive a sequence of clicks and assert contiguity throughout.
+        sel = []
+        for click in (1, 2, 0, 2):   # build 1,2 -> 1,2 (0 not adjacent to ends? front1/back2)
+            sel = contiguous_edge_toggle(sel, click, self.N, closed=True)
+        # After 1 ->[1]; 2 ->[1,2]; 0 -> prev of front(1) is 0 -> [0,1,2]; 2 -> remove end ->[0,1]
+        self.assertEqual(sel, [0, 1])
 
 
 if __name__ == "__main__":
