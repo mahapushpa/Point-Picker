@@ -133,7 +133,7 @@ class ProjectDBTests(unittest.TestCase):
 
     def test_add_custom_unit_profile(self):
         with ProjectDB.create(self.tmp / "proj") as p:
-            uid = p.add_unit_profile("Bigha - Jaipur", 2529.29)
+            uid = p.create_unit_profile("Bigha - Jaipur", 2529.29)
             got = [u for u in p.list_unit_profiles() if u["id"] == uid][0]
             self.assertFalse(got["is_builtin"])
             self.assertAlmostEqual(got["sq_m_per_unit"], 2529.29)
@@ -593,6 +593,26 @@ class UnitProfileTests(unittest.TestCase):
             names = [u["name"] for u in p.list_unit_profiles()]
             self.assertEqual(names[:4], ["square metre", "square foot", "acre", "hectare"])
             self.assertIn("Bigha — Jaipur", names)
+
+    def test_list_order_builtins_first_then_users_by_name(self):
+        # Directly guards the M9 ordering contract against the *live* bound
+        # ProjectDB.list_unit_profiles (a duplicate definition once silently
+        # shadowed this, reverting user ordering to creation order — see
+        # test_architecture.NoDuplicateDefinitions). User profiles are added
+        # out of alphabetical order on purpose.
+        with ProjectDB.create(self.tmp / "proj") as p:
+            p.create_unit_profile("Zebra unit", 100.0)
+            p.create_unit_profile("alpha unit", 200.0)
+            p.create_unit_profile("Mango unit", 300.0)
+            profiles = p.list_unit_profiles()
+            # Built-ins first, in their canonical seed order.
+            self.assertEqual([u["name"] for u in profiles[:4]],
+                             ["square metre", "square foot", "acre", "hectare"])
+            self.assertTrue(all(u["is_builtin"] for u in profiles[:4]))
+            # Then user profiles, case-insensitively by name (NOT creation order).
+            user_names = [u["name"] for u in profiles[4:]]
+            self.assertEqual(user_names, ["alpha unit", "Mango unit", "Zebra unit"])
+            self.assertFalse(any(u["is_builtin"] for u in profiles[4:]))
 
     def test_create_rejects_duplicate_and_bad_factor(self):
         with ProjectDB.create(self.tmp / "proj") as p:

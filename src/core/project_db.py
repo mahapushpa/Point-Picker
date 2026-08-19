@@ -993,23 +993,6 @@ class ProjectDB:
             "DELETE FROM vertices WHERE source_id = ? AND id NOT IN "
             "(SELECT vertex_id FROM parcel_vertices)", (source_id,))
 
-    # -- unit profiles ------------------------------------------------------
-
-    def add_unit_profile(self, name: str, sq_m_per_unit: float) -> int:
-        cur = self.conn.execute(
-            "INSERT INTO unit_profiles (name, sq_m_per_unit, is_builtin, created_at) "
-            "VALUES (?, ?, 0, ?)",
-            (name, float(sq_m_per_unit), _utcnow()),
-        )
-        self.conn.commit()
-        return int(cur.lastrowid)
-
-    def list_unit_profiles(self) -> list[dict]:
-        rows = self.conn.execute(
-            "SELECT id, name, sq_m_per_unit, is_builtin, created_at FROM unit_profiles ORDER BY id"
-        ).fetchall()
-        return [dict(r) for r in rows]
-
     # -- lifecycle ----------------------------------------------------------
 
     def table_names(self) -> list[str]:

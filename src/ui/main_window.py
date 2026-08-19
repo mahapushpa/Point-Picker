@@ -36,12 +36,14 @@ from ..core.project_db import ProjectDB, ProjectError
 from ..core.scale import compute_two_point_scale, TwoPointScale
 from ..core.selection import parcel_at_point, parcels_in_rect
 from ..core import units
+from ..export import report as report_export
 from ..io.raster import open_raster
 from ..io.preprocess import preprocess_raster
 from .canvas_view import CanvasView
 from .unit_profiles_dialog import UnitProfilesDialog
 from .templates_dialog import TemplatesDialog
 from .identification_dialog import IdentificationDialog
+from .report_dialog import OwnerReportDialog as ReportDialog
 
 #: Stable, visually-distinct colours assigned to parcels by their position, so
 #: several boundaries on one sheet don't get confused. Avoids the green used by
@@ -307,6 +309,14 @@ class MainWindow(QMainWindow):
         manage_tmpl_act = QAction("Manage &templates…", self)
         manage_tmpl_act.triggered.connect(self.manage_templates)
         records_menu.addAction(manage_tmpl_act)
+
+        reports_menu = self.menuBar().addMenu("Rep&orts")
+        owner_report_act = QAction("&Owner-wise summary…", self)
+        owner_report_act.setToolTip(
+            "Export every parcel grouped by owner, with per-owner area totals "
+            "(PDF / CSV / JSON)")
+        owner_report_act.triggered.connect(self.export_owner_report)
+        reports_menu.addAction(owner_report_act)
 
         select_menu = self.menuBar().addMenu("Se&lection")
         select_act = QAction("&Select parcels (click / marquee)", self)
@@ -981,6 +991,65 @@ class MainWindow(QMainWindow):
             self._owner_edit.blockSignals(True)
             self._owner_edit.setText((parcel.get("owner") or "") if parcel else "")
             self._owner_edit.blockSignals(False)
+
+    # -- reports (Milestone 11) ---------------------------------------------
+
+    def export_owner_report(self) -> None:
+        """Generate the owner-wise summary (parcels grouped by owner, with
+        per-owner and grand-total area) as PDF / CSV / JSON into the project's
+        ``exports/`` folder. Scope follows M7's selection: if a non-empty parcel
+        selection is active it is used, otherwise every parcel in the project.
+        All report logic lives in ``src.export.report``; this only chooses the
+        scope, previews coverage, and writes files."""
+        if self._project is None:
+            QMessageBox.information(
+                self, "No project",
+                "Open or create a project first — reports cover a project's parcels.")
+            return
+
+        # Reuse M7's selection hook: a non-empty selection scopes the report;
+        # an empty selection means "all parcels in the project".
+        selected = self.selected_parcel_ids()
+        parcel_ids = set(selected) if selected else None
+        scope_label = (f"{len(selected)} selected parcel(s) on this sheet"
+                       if selected else "all parcels in the project")
+
+        report = report_export.build_owner_report(self._project, parcel_ids=parcel_ids)
+        if report.parcel_count == 0:
+            QMessageBox.information(
+                self, "Nothing to report",
+                "No parcels found for this report. Trace a parcel boundary first.")
+            return
+
+        # Preview coverage (owners/parcels) and pick formats before generating.
+        dlg = ReportDialog(report, scope_label, self)
+        if not dlg.exec():
+            return
+        formats = dlg.selected_formats()   # always includes PDF (primary)
+
+        # One file per owner per format, written to never-overwriting timestamped
+        # paths in exports/ (brief storage rule). All of this lives in report.py.
+        try:
+            _report, report_paths, image_paths = report_export.export_owner_reports(
+                self._project, self._project.exports_dir,
+                formats=formats, parcel_ids=parcel_ids)
+        except Exception as exc:   # e.g. PyMuPDF missing for PDF, or a write error
+            QMessageBox.warning(self, "Export failed", str(exc))
+            return
+
+        written = report_paths + image_paths
+        names = "\n".join(f"  • {p.name}" for p in written)
+        extra = (f"\n\n{report.missing_scale_count} parcel(s) had no scale set and "
+                 "were excluded from area totals." if report.missing_scale_count else "")
+        img_note = (f"\n({len(image_paths)} boundary image file(s) saved separately.)"
+                    if image_paths else "")
+        QMessageBox.information(
+            self, "Report generated",
+            f"Owner-wise summary written to {self._project.exports_dir}:\n{names}\n\n"
+            f"{len(report_paths)} report file(s) — one per owner "
+            f"({report.owner_count} owner(s)) × {len(formats)} format(s).{img_note}{extra}")
+        self._status.setText(
+            f"Generated owner-wise report → {len(report_paths)} file(s) in exports/")
 
     # -- readouts -----------------------------------------------------------
 

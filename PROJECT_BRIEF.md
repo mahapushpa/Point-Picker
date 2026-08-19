@@ -180,11 +180,17 @@ cleaner scan makes a scale bar or grid line easier to click precisely).
 Three distinct outputs, not one generic report — each serves a different
 purpose:
 
-1. **Owner-wise summary report.** Grouped by owner: every khasra/parcel
-   under that owner, its identification fields, area and perimeter, and a
+1. **Owner-wise summary report — one report file per owner, not one
+   combined multi-owner document.** For each owner: every khasra/parcel
+   under them, its identification fields, area and perimeter, and a
    **total row** (combined area across all their parcels). This is the
    standard format revenue-land summaries are expected in, and is the
-   primary deliverable most sessions will end with.
+   primary deliverable most sessions will end with. Each parcel's entry
+   includes a cropped image of its traced boundary from the source sheet
+   (not the whole sheet — just that khasra's region, with some padding),
+   embedded in the PDF; if a crop doesn't fit the page layout well,
+   export it as a separate image file alongside the PDF instead of
+   forcing a bad fit.
 2. **Segment-length / boundary-description report — a separate, specific
    report type, not a byproduct of the summary.** Traditional boundary
    descriptions list each edge with direction and length (e.g. "North:

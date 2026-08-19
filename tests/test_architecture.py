@@ -32,6 +32,24 @@ def _imported_roots(pyfile: Path):
     return roots
 
 
+def _duplicate_defs(tree):
+    """Yield (scope, name, line) for every function/method defined more than once
+    within the same scope (module body or a class body). A later ``def`` silently
+    replaces an earlier one in Python, so a duplicate is almost always a bug — e.g.
+    two ``ProjectDB.list_unit_profiles`` where the second reverted an ordering
+    guarantee (M9 regression, caught here going forward)."""
+    def scan(scope_name, body):
+        seen = {}
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name in seen:
+                    yield (scope_name, node.name, node.lineno)
+                seen[node.name] = node.lineno
+            if isinstance(node, ast.ClassDef):
+                yield from scan(f"{scope_name}.{node.name}", node.body)
+    yield from scan("<module>", tree.body)
+
+
 class NoUiImportsInPureLayers(unittest.TestCase):
     def test_pure_packages_have_no_ui_imports(self):
         checked = 0
@@ -44,6 +62,22 @@ class NoUiImportsInPureLayers(unittest.TestCase):
                     f"{pyfile.relative_to(SRC)} imports UI framework(s): {sorted(leaked)}",
                 )
         self.assertGreater(checked, 0, "no pure-layer modules were scanned")
+
+
+class NoDuplicateDefinitions(unittest.TestCase):
+    def test_no_duplicate_function_or_method_names(self):
+        checked = 0
+        for pyfile in SRC.rglob("*.py"):
+            checked += 1
+            tree = ast.parse(pyfile.read_text(encoding="utf-8"), filename=str(pyfile))
+            dups = list(_duplicate_defs(tree))
+            self.assertFalse(
+                dups,
+                f"{pyfile.relative_to(SRC)} has duplicate definition(s) (a later "
+                f"def silently shadows the earlier one): "
+                + "; ".join(f"{scope}.{name} at line {line}" for scope, name, line in dups),
+            )
+        self.assertGreater(checked, 0, "no modules were scanned")
 
 
 if __name__ == "__main__":
