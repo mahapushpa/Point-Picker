@@ -674,5 +674,157 @@ class UnitProfileTests(unittest.TestCase):
             self.assertEqual(p2.get_source_unit_profile(sid)["id"], pid)
 
 
+class TemplateAndFieldsTests(unittest.TestCase):
+    """Milestone 10: land-type templates + parcel identification fields."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="lmt_tmpl_"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _source_id(self, p):
+        sample = self.tmp / "sheet.png"
+        if not sample.exists():
+            sample.write_bytes(b"x")
+        return p.import_source(sample, "image")
+
+    # -- built-in templates --------------------------------------------------
+
+    def test_builtin_templates_seeded(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            tmpls = p.list_templates()
+            names = [t["name"] for t in tmpls]
+            self.assertEqual(names, ["Rural — agricultural", "Rural — residential", "Urban"])
+            self.assertTrue(all(t["is_builtin"] for t in tmpls))
+            agri = p.get_template(next(t["id"] for t in tmpls if t["name"] == "Rural — agricultural"))
+            self.assertEqual(agri["fields"],
+                             ["Khasra number", "Khata number", "Village", "Tehsil",
+                              "District", "Land classification"])
+            # Owner is NOT a template field (it's the first-class column).
+            self.assertNotIn("Owner", agri["fields"])
+
+    def test_builtins_cannot_be_edited_or_deleted(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            urban = next(t for t in p.list_templates() if t["name"] == "Urban")
+            with self.assertRaises(ProjectError):
+                p.update_template(urban["id"], name="x")
+            with self.assertRaises(ProjectError):
+                p.update_template(urban["id"], labels=["a", "b"])
+            with self.assertRaises(ProjectError):
+                p.delete_template(urban["id"])
+
+    # -- user template CRUD --------------------------------------------------
+
+    def test_create_and_get_user_template(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            tid = p.create_template("Orchard", ["Survey no", " Trees ", "", "Village"])
+            got = p.get_template(tid)
+            self.assertFalse(got["is_builtin"])
+            self.assertEqual(got["fields"], ["Survey no", "Trees", "Village"])  # trimmed, blanks dropped
+
+    def test_create_rejects_empty_or_duplicate_name(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            p.create_template("Dup", ["A"])
+            with self.assertRaises(ProjectError):
+                p.create_template("Dup", ["B"])
+            with self.assertRaises(ProjectError):
+                p.create_template("   ", ["A"])
+            with self.assertRaises(ProjectError):
+                p.create_template("Rural — agricultural", ["A"])  # clashes with a built-in name
+
+    def test_update_and_delete_user_template(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            tid = p.create_template("T", ["A", "B"])
+            p.update_template(tid, name="T2", labels=["X", "Y", "Z"])
+            got = p.get_template(tid)
+            self.assertEqual(got["name"], "T2")
+            self.assertEqual(got["fields"], ["X", "Y", "Z"])
+            p.delete_template(tid)
+            self.assertIsNone(p.get_template(tid))
+
+    def test_templates_persist_across_reopen(self):
+        root = self.tmp / "proj"
+        with ProjectDB.create(root) as p:
+            tid = p.create_template("Orchard", ["Survey no", "Village"])
+        with ProjectDB.open(root) as p2:
+            self.assertEqual(p2.get_template(tid)["fields"], ["Survey no", "Village"])
+
+    # -- parcel fields + apply ----------------------------------------------
+
+    def test_set_and_get_parcel_fields(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            pid = p.create_parcel(sid)
+            p.set_parcel_fields(pid, [{"label": "Khasra", "value": "123"},
+                                      ("Village", "Rampur"),
+                                      {"label": "  ", "value": "dropped"}])  # blank label dropped
+            fields = p.get_parcel_fields(pid)
+            self.assertEqual(fields, [{"label": "Khasra", "value": "123"},
+                                      {"label": "Village", "value": "Rampur"}])
+
+    def test_apply_template_populates_parcel_fields(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            pid = p.create_parcel(sid)
+            agri = next(t for t in p.list_templates() if t["name"] == "Rural — agricultural")
+            p.apply_template_to_parcel(pid, agri["id"])
+            labels = [f["label"] for f in p.get_parcel_fields(pid)]
+            self.assertEqual(labels, p.get_template(agri["id"])["fields"])
+            self.assertTrue(all(f["value"] == "" for f in p.get_parcel_fields(pid)))
+
+    def test_apply_preserves_existing_values_by_label(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            pid = p.create_parcel(sid)
+            p.set_parcel_fields(pid, [("Village", "Rampur"), ("Extra", "keepme?")])
+            agri = next(t for t in p.list_templates() if t["name"] == "Rural — agricultural")
+            p.apply_template_to_parcel(pid, agri["id"])
+            fields = {f["label"]: f["value"] for f in p.get_parcel_fields(pid)}
+            self.assertEqual(fields["Village"], "Rampur")  # carried over
+            self.assertNotIn("Extra", fields)              # not in template -> dropped
+            self.assertEqual(fields["Khasra number"], "")  # new template label, empty
+
+    def test_editing_parcel_fields_does_not_mutate_template(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            pid = p.create_parcel(sid)
+            agri = next(t for t in p.list_templates() if t["name"] == "Rural — agricultural")
+            before = p.get_template(agri["id"])["fields"]
+            p.apply_template_to_parcel(pid, agri["id"])
+            # Heavily edit the parcel's fields: rename, add values, drop some.
+            p.set_parcel_fields(pid, [("Khasra number", "999"), ("New field", "x")])
+            after = p.get_template(agri["id"])["fields"]
+            self.assertEqual(before, after)  # template untouched
+
+    def test_owner_and_notes_coexist_with_fields(self):
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            pid = p.create_parcel(sid, owner="Ramesh")
+            p.update_parcel(pid, notes="corner plot near well")
+            p.set_parcel_fields(pid, [("Khasra number", "123")])
+            parcel = p.get_parcel(pid)
+            self.assertEqual(parcel["owner"], "Ramesh")       # column intact
+            self.assertEqual(parcel["notes"], "corner plot near well")
+            self.assertEqual(p.get_parcel_fields(pid), [{"label": "Khasra number", "value": "123"}])
+
+    def test_upgrade_from_v6_seeds_templates(self):
+        """A v6 project (no templates tables) upgrades additively and gains the
+        built-in templates."""
+        root = self.tmp / "legacy6"
+        with ProjectDB.create(root) as p:
+            self._source_id(p)
+        conn = sqlite3.connect(str(root / "project.db"))
+        conn.execute("DROP TABLE template_fields")
+        conn.execute("DROP TABLE templates")
+        conn.execute("PRAGMA user_version = 6")
+        conn.commit()
+        conn.close()
+        with ProjectDB.open(root) as p2:
+            self.assertEqual(p2.schema_version, SCHEMA_VERSION)
+            names = [t["name"] for t in p2.list_templates()]
+            self.assertEqual(names, ["Rural — agricultural", "Rural — residential", "Urban"])
+
+
 if __name__ == "__main__":
     unittest.main()

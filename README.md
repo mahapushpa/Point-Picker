@@ -9,7 +9,7 @@ See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) for the full specification. The prior
 browser prototypes whose *logic* seeds this tool are kept under
 [reference/](reference/) for reference only.
 
-## Status — Milestones 1–9 complete
+## Status — Milestones 1–10 complete
 
 - **Milestone 1 — portable project store**: create/open a project folder
   (`project.db` + `sources/` + `exports/`); its SQLite schema works identically
@@ -102,8 +102,22 @@ browser prototypes whose *logic* seeds this tool are kept under
   only, so perimeter and segment lengths stay SI. With no profile selected the
   readout falls back to SI alone.
 
-Later milestones (identification templates, reports, DXF, location-fixing) are
-scaffolded or pending and will be filled in one milestone at a time.
+- **Milestone 10 — land-type templates + identification fields**: each parcel
+  carries revenue-record metadata as `{label, value}` pairs (never fixed
+  columns), so it can hold multiple identifiers (old Khasra *and* new Plot no.)
+  and address levels without a schema change. **Built-in templates** (Rural —
+  agricultural / Rural — residential / Urban) are seeded per project and
+  protected read-only at the DB layer; **user templates** are fully editable via
+  a **Manage templates…** dialog — same pattern as M9's units. Applying a
+  template to a parcel populates its **Identification…** form (a one-way copy —
+  editing the parcel never changes the template). Always present regardless of
+  template: the **source-document reference**, the **owner** (kept as the
+  first-class `parcels.owner` grouping key for owner-wise reports, surfaced in the
+  same form), and a free-text **notes** field. Templates travel with the project
+  (schema v7: additive `templates` + `template_fields` tables).
+
+Later milestones (reports, DXF, location-fixing) are scaffolded or pending and
+will be filled in one milestone at a time.
 
 ### Run commands
 
@@ -141,7 +155,7 @@ src/
     polygon.py       shared-vertex snap rule + tolerance                (DONE)
     selection.py     parcel hit-testing (click + marquee) for M7        (DONE)
     units.py         built-in + local area-unit conversions (SI-canon)  (DONE)
-    templates.py                                                        (stub)
+    templates.py     (land-type templates live in project_db, M10)      (n/a)
   io/                pure-Python file loaders (no Qt)
     raster.py        neutral RasterImage type + open_raster dispatcher   (DONE)
     preprocess.py    denoise (median) + contrast (CLAHE), value-only     (DONE)

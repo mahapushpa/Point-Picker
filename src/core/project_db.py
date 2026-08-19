@@ -47,8 +47,10 @@ from .units import BUILTIN_AREA_UNITS
 #: replaced by shared ``vertices`` + ``parcel_vertices``, with a dedicated
 #: rebuild migration (see ``_migrate_points_to_vertices``). v6 (Milestone 9)
 #: adds ``sources.unit_profile_id`` — the local area-unit profile selected for
-#: display on that source — a purely additive nullable column.
-SCHEMA_VERSION = 6
+#: display on that source — a purely additive nullable column. v7 (Milestone 10)
+#: adds the ``templates`` + ``template_fields`` tables (built-in + user land-type
+#: templates), purely additive (new tables via CREATE TABLE IF NOT EXISTS).
+SCHEMA_VERSION = 7
 
 DB_FILENAME = "project.db"
 SOURCES_DIRNAME = "sources"
@@ -114,7 +116,11 @@ CREATE TABLE IF NOT EXISTS parcels (
 -- Identification / revenue-record metadata as {label, value} pairs, so field
 -- names are never hardcoded and a parcel can carry any number of identifiers
 -- and address levels (PROJECT_BRIEF.md "Land identification & revenue-record
--- fields").
+-- fields"). `owner` (a parcels column) is the one identification datum kept as a
+-- first-class column, because it is the grouping KEY for owner-wise reports and
+-- must not be a freely-renamable label; it is surfaced in the same form. `notes`
+-- (a parcels column) and the source-document reference are always present too,
+-- independent of any template — so none of those three live here.
 CREATE TABLE IF NOT EXISTS parcel_fields (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     parcel_id INTEGER NOT NULL REFERENCES parcels(id) ON DELETE CASCADE,
@@ -122,6 +128,26 @@ CREATE TABLE IF NOT EXISTS parcel_fields (
     label     TEXT    NOT NULL,
     value     TEXT
 );
+
+-- Land-type templates: a reusable STARTING set of identification field labels
+-- (Milestone 10). Built-ins (three land types) are seeded and protected from
+-- edit/delete at the DB layer, exactly like built-in unit profiles; user
+-- templates are fully editable. A template is a starting point only — applying
+-- it copies its labels onto a parcel; editing that parcel never touches the
+-- template. Stored in the project DB so templates travel with the project.
+CREATE TABLE IF NOT EXISTS templates (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT    NOT NULL UNIQUE,
+    is_builtin INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT    NOT NULL
+);
+CREATE TABLE IF NOT EXISTS template_fields (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_id INTEGER NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+    seq         INTEGER NOT NULL,                        -- display order
+    label       TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_template_fields ON template_fields(template_id, seq);
 
 -- Boundary vertices (Milestone 6: topology-aware shared boundaries). A vertex
 -- is stored ONCE per source and shared by every parcel whose boundary passes
@@ -171,6 +197,22 @@ CREATE TABLE IF NOT EXISTS source_scales (
 #: Single source of truth for the factors is ``core.units`` so the DB seed and
 #: the conversion logic can never drift apart.
 BUILTIN_UNIT_PROFILES = tuple(BUILTIN_AREA_UNITS.items())
+
+#: Built-in land-type templates seeded per project (Milestone 10), protected from
+#: edit/delete. Each is ``(name, (field label, ...))``. Owner is intentionally
+#: NOT listed: it is a first-class ``parcels.owner`` column (the report grouping
+#: key), surfaced in the same form; notes and the source reference are likewise
+#: always present, independent of the template. So these lists hold only the
+#: template-specific identification/address labels.
+BUILTIN_TEMPLATES = (
+    ("Rural — agricultural",
+     ("Khasra number", "Khata number", "Village", "Tehsil", "District",
+      "Land classification")),
+    ("Rural — residential",
+     ("Plot number", "Village", "Tehsil", "District")),
+    ("Urban",
+     ("Plot/House number", "Colony/Locality", "Ward", "City", "District")),
+)
 
 #: Columns added to existing tables after their first release. Applied
 #: additively via guarded ``ALTER TABLE ADD COLUMN`` (CREATE TABLE IF NOT EXISTS
@@ -256,6 +298,7 @@ class ProjectDB:
                 list(meta.items()),
             )
             _seed_builtin_units(conn)
+            _seed_builtin_templates(conn)
             conn.commit()
         except Exception:
             conn.close()
@@ -289,6 +332,7 @@ class ProjectDB:
             conn.executescript(SCHEMA_SQL)   # new tables (source_scales, vertices, parcel_vertices)
             _ensure_additive_columns(conn)   # new columns (parcels.closed / owner, sources.unit_profile_id)
             _seed_builtin_units(conn)        # ensure built-in units exist post-upgrade
+            _seed_builtin_templates(conn)    # ensure built-in templates exist post-upgrade
             if _table_exists(conn, "points"):
                 # v5 restructuring: rebuild per-parcel points as shared vertices,
                 # then drop the old table. Safe as a clean rebuild since only
@@ -408,6 +452,14 @@ class ProjectDB:
         row = self.conn.execute(
             "SELECT id, relative_path, file_type, original_name, page, doc_date, added_at "
             "FROM sources WHERE relative_path = ?", (rel,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_source(self, source_id: int) -> dict | None:
+        """A source row by id (for the always-present source-document reference)."""
+        row = self.conn.execute(
+            "SELECT id, relative_path, file_type, original_name, page, doc_date, added_at "
+            "FROM sources WHERE id = ?", (source_id,)
         ).fetchone()
         return dict(row) if row else None
 
@@ -577,6 +629,154 @@ class ProjectDB:
         ).fetchone()
         return dict(row) if row else None
 
+    # -- land-type templates (Milestone 10) ---------------------------------
+    #
+    # A template is a reusable starting set of identification field LABELS.
+    # Built-ins (the three land types) are protected read-only, exactly like
+    # built-in unit profiles; user templates are fully editable. Applying a
+    # template copies its labels onto a parcel's own {label, value} fields — a
+    # one-way copy, so editing a parcel never changes the template.
+
+    def list_templates(self) -> list[dict]:
+        """All templates, built-ins first then user templates by name. Each:
+        id, name, is_builtin. Use :meth:`get_template` for the field list."""
+        rows = self.conn.execute(
+            "SELECT id, name, is_builtin FROM templates "
+            "ORDER BY is_builtin DESC, "
+            "CASE WHEN is_builtin = 1 THEN id ELSE 0 END, name COLLATE NOCASE"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_template(self, template_id: int) -> dict | None:
+        """A template as ``{id, name, is_builtin, fields: [label, ...]}`` in field
+        order, or None if there is no such template."""
+        row = self.conn.execute(
+            "SELECT id, name, is_builtin FROM templates WHERE id = ?", (template_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        labels = [r["label"] for r in self.conn.execute(
+            "SELECT label FROM template_fields WHERE template_id = ? ORDER BY seq",
+            (template_id,))]
+        out = dict(row)
+        out["fields"] = labels
+        return out
+
+    def create_template(self, name: str, labels) -> int:
+        """Create a user template from *name* and an ordered iterable of field
+        *labels* (blank labels are dropped). Raises on empty/duplicate name."""
+        name = (name or "").strip()
+        if not name:
+            raise ProjectError("Template name must not be empty.")
+        clean = [str(lbl).strip() for lbl in labels if str(lbl).strip()]
+        now = _utcnow()
+        try:
+            cur = self.conn.execute(
+                "INSERT INTO templates (name, is_builtin, created_at) VALUES (?, 0, ?)",
+                (name, now),
+            )
+        except sqlite3.IntegrityError:
+            raise ProjectError(f"A template named {name!r} already exists.")
+        tid = int(cur.lastrowid)
+        for seq, label in enumerate(clean):
+            self.conn.execute(
+                "INSERT INTO template_fields (template_id, seq, label) VALUES (?, ?, ?)",
+                (tid, seq, label))
+        self.conn.commit()
+        return tid
+
+    def update_template(self, template_id: int, *, name: str | None = None,
+                        labels=None) -> None:
+        """Rename a user template and/or replace its field labels. Built-ins are
+        fixed and cannot be changed."""
+        existing = self.get_template(template_id)
+        if existing is None:
+            raise ProjectError(f"No template with id {template_id}.")
+        if existing["is_builtin"]:
+            raise ProjectError(f"The built-in template {existing['name']!r} cannot be edited.")
+        if name is not None:
+            new_name = name.strip()
+            if not new_name:
+                raise ProjectError("Template name must not be empty.")
+            try:
+                self.conn.execute("UPDATE templates SET name = ? WHERE id = ?",
+                                  (new_name, template_id))
+            except sqlite3.IntegrityError:
+                raise ProjectError(f"A template named {new_name!r} already exists.")
+        if labels is not None:
+            clean = [str(lbl).strip() for lbl in labels if str(lbl).strip()]
+            self.conn.execute("DELETE FROM template_fields WHERE template_id = ?", (template_id,))
+            for seq, label in enumerate(clean):
+                self.conn.execute(
+                    "INSERT INTO template_fields (template_id, seq, label) VALUES (?, ?, ?)",
+                    (template_id, seq, label))
+        self.conn.commit()
+
+    def delete_template(self, template_id: int) -> None:
+        """Delete a user template (and its field labels, ON DELETE CASCADE).
+        Built-ins cannot be deleted."""
+        existing = self.get_template(template_id)
+        if existing is None:
+            raise ProjectError(f"No template with id {template_id}.")
+        if existing["is_builtin"]:
+            raise ProjectError(f"The built-in template {existing['name']!r} cannot be deleted.")
+        self.conn.execute("DELETE FROM templates WHERE id = ?", (template_id,))
+        self.conn.commit()
+
+    # -- parcel identification fields (Milestone 10) ------------------------
+    #
+    # A parcel's own {label, value} pairs (kept separate from templates, which
+    # are only a starting point). Owner/notes/source-ref are handled elsewhere
+    # (a column / the source relationship) and are not stored here.
+
+    def get_parcel_fields(self, parcel_id: int) -> list[dict]:
+        """A parcel's identification fields as ``[{label, value}]`` in order."""
+        rows = self.conn.execute(
+            "SELECT label, value FROM parcel_fields WHERE parcel_id = ? ORDER BY seq",
+            (parcel_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_parcel_fields(self, parcel_id: int, fields) -> None:
+        """Replace a parcel's identification fields with *fields* — an ordered
+        iterable of ``{label, value}`` dicts or ``(label, value)`` pairs. Blank
+        labels are dropped; values default to empty string."""
+        if self.conn.execute("SELECT 1 FROM parcels WHERE id = ?", (parcel_id,)).fetchone() is None:
+            raise ProjectError(f"No parcel with id {parcel_id} in this project.")
+        normalized = []
+        for f in fields:
+            if isinstance(f, dict):
+                label, value = f.get("label"), f.get("value")
+            else:
+                label, value = f
+            label = (label or "").strip()
+            if not label:
+                continue
+            normalized.append((label, "" if value is None else str(value)))
+        self.conn.execute("DELETE FROM parcel_fields WHERE parcel_id = ?", (parcel_id,))
+        for seq, (label, value) in enumerate(normalized):
+            self.conn.execute(
+                "INSERT INTO parcel_fields (parcel_id, seq, label, value) VALUES (?, ?, ?, ?)",
+                (parcel_id, seq, label, value))
+        self.conn.execute("UPDATE parcels SET updated_at = ? WHERE id = ?",
+                          (_utcnow(), parcel_id))
+        self.conn.commit()
+
+    def apply_template_to_parcel(self, parcel_id: int, template_id: int) -> list[dict]:
+        """Populate a parcel's fields from *template_id*'s labels (a one-way copy;
+        the template is untouched). Values already present under a matching label
+        are preserved; labels not in the template are dropped. Returns the new
+        fields. Applying is a starting point — the user edits the parcel freely
+        afterwards without affecting the template."""
+        template = self.get_template(template_id)
+        if template is None:
+            raise ProjectError(f"No template with id {template_id}.")
+        if self.conn.execute("SELECT 1 FROM parcels WHERE id = ?", (parcel_id,)).fetchone() is None:
+            raise ProjectError(f"No parcel with id {parcel_id} in this project.")
+        existing = {f["label"]: f["value"] for f in self.get_parcel_fields(parcel_id)}
+        new_fields = [(label, existing.get(label, "")) for label in template["fields"]]
+        self.set_parcel_fields(parcel_id, new_fields)
+        return self.get_parcel_fields(parcel_id)
+
     # -- parcels & shared vertices (Milestone 6) ----------------------------
     #
     # A source can carry several parcels; a parcel's boundary is an ordered list
@@ -618,9 +818,11 @@ class ProjectDB:
         ).fetchone()
         return dict(row) if row else None
 
-    def update_parcel(self, parcel_id: int, *, name=_UNSET, owner=_UNSET) -> None:
-        """Update the given parcel fields (only those passed). ``owner=None``
-        clears the owner; omitting it leaves the owner unchanged."""
+    def update_parcel(self, parcel_id: int, *, name=_UNSET, owner=_UNSET,
+                      notes=_UNSET) -> None:
+        """Update the given parcel columns (only those passed). Passing ``None``
+        clears that column (e.g. ``owner=None``); omitting it leaves it unchanged.
+        ``notes`` is the always-present free-text notes (M10)."""
         sets, params = [], []
         if name is not _UNSET:
             sets.append("name = ?")
@@ -628,6 +830,9 @@ class ProjectDB:
         if owner is not _UNSET:
             sets.append("owner = ?")
             params.append(owner)
+        if notes is not _UNSET:
+            sets.append("notes = ?")
+            params.append(notes)
         if not sets:
             return
         sets.append("updated_at = ?")
@@ -855,6 +1060,26 @@ def _seed_builtin_units(conn: sqlite3.Connection) -> None:
             "(name, sq_m_per_unit, is_builtin, created_at) VALUES (?, ?, 1, ?)",
             (uname, factor, now),
         )
+
+
+def _seed_builtin_templates(conn: sqlite3.Connection) -> None:
+    """Insert the fixed built-in land-type templates if absent. Idempotent: the
+    template row is guarded by ``INSERT OR IGNORE`` on the UNIQUE name, and its
+    field labels are only (re)inserted when the template was newly created, so
+    running this on upgrade never duplicates fields."""
+    now = _utcnow()
+    for name, labels in BUILTIN_TEMPLATES:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO templates (name, is_builtin, created_at) VALUES (?, 1, ?)",
+            (name, now),
+        )
+        if cur.rowcount:  # newly inserted -> populate its fields once
+            tid = cur.lastrowid
+            for seq, label in enumerate(labels):
+                conn.execute(
+                    "INSERT INTO template_fields (template_id, seq, label) VALUES (?, ?, ?)",
+                    (tid, seq, label),
+                )
 
 
 def _migrate_points_to_vertices(conn: sqlite3.Connection) -> None:

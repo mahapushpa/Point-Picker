@@ -40,6 +40,8 @@ from ..io.raster import open_raster
 from ..io.preprocess import preprocess_raster
 from .canvas_view import CanvasView
 from .unit_profiles_dialog import UnitProfilesDialog
+from .templates_dialog import TemplatesDialog
+from .identification_dialog import IdentificationDialog
 
 #: Stable, visually-distinct colours assigned to parcels by their position, so
 #: several boundaries on one sheet don't get confused. Avoids the green used by
@@ -231,6 +233,13 @@ class MainWindow(QMainWindow):
         self._owner_edit.editingFinished.connect(self._on_owner_edited)
         layout.addWidget(self._owner_edit)
 
+        # Identification / revenue-record fields for the active parcel (M10).
+        self._ident_btn = QPushButton("Identification…")
+        self._ident_btn.setToolTip("Edit this parcel's identification fields, apply a "
+                                   "land-type template, and edit notes")
+        self._ident_btn.clicked.connect(self.edit_identification)
+        layout.addWidget(self._ident_btn)
+
         dock.setWidget(body)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         self._parcel_dock = dock
@@ -290,6 +299,14 @@ class MainWindow(QMainWindow):
         manage_units_act = QAction("&Manage unit profiles…", self)
         manage_units_act.triggered.connect(self.manage_unit_profiles)
         units_menu.addAction(manage_units_act)
+
+        records_menu = self.menuBar().addMenu("&Records")
+        ident_act = QAction("Edit &identification fields…", self)
+        ident_act.triggered.connect(self.edit_identification)
+        records_menu.addAction(ident_act)
+        manage_tmpl_act = QAction("Manage &templates…", self)
+        manage_tmpl_act.triggered.connect(self.manage_templates)
+        records_menu.addAction(manage_tmpl_act)
 
         select_menu = self.menuBar().addMenu("Se&lection")
         select_act = QAction("&Select parcels (click / marquee)", self)
@@ -536,6 +553,7 @@ class MainWindow(QMainWindow):
         self._new_parcel_btn.setEnabled(has_project)
         self._del_parcel_btn.setEnabled(has_project and self._active_parcel_id is not None)
         self._owner_edit.setEnabled(has_project and self._active_parcel_id is not None)
+        self._ident_btn.setEnabled(has_project and self._active_parcel_id is not None)
         self._select_all_btn.setEnabled(has_parcels)
         self._clear_sel_btn.setEnabled(has_parcels and bool(self._selected_parcel_ids))
 
@@ -933,6 +951,36 @@ class MainWindow(QMainWindow):
         if self._project is None or self._source_id is None:
             return None
         return self._project.get_source_unit_profile(self._source_id)
+
+    # -- identification templates & fields (Milestone 10) -------------------
+
+    def manage_templates(self) -> None:
+        """Open the create/edit/delete dialog for land-type templates."""
+        if self._project is None:
+            QMessageBox.information(
+                self, "No project",
+                "Open or create a project first — templates are saved per project.")
+            return
+        TemplatesDialog(self._project, self).exec()
+
+    def edit_identification(self) -> None:
+        """Open the identification-fields form for the active parcel."""
+        if self._project is None or self._active_parcel_id is None:
+            QMessageBox.information(
+                self, "No parcel",
+                "Select a parcel first — identification fields are per parcel.")
+            return
+        dlg = IdentificationDialog(self._project, self._active_parcel_id, self)
+        if dlg.exec():
+            # Owner may have changed in the form; keep the dock + list in sync.
+            index = self._parcel_index(self._active_parcel_id)
+            parcel = self._project.get_parcel(self._active_parcel_id)
+            if index is not None and parcel is not None:
+                self._parcels[index]["owner"] = parcel.get("owner")
+                self._update_parcel_list_row(index)
+            self._owner_edit.blockSignals(True)
+            self._owner_edit.setText((parcel.get("owner") or "") if parcel else "")
+            self._owner_edit.blockSignals(False)
 
     # -- readouts -----------------------------------------------------------
 

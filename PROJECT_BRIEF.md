@@ -101,8 +101,14 @@ names. Model it as:
 - Also always: source document reference (file name, page, date) and a
   free-text notes field, regardless of template.
 
-Store templates as simple JSON/YAML under `config/templates/` so new land
-types or regional variants can be added without touching code.
+Store templates in the project DB, the same way unit profiles are stored
+(M9) — portable with the project folder to any machine or pen drive,
+rather than as app-level config files tied to one machine's install.
+Built-in starting templates (the three land types above) are seeded into
+a new project the same way built-in units are seeded, and are similarly
+protected from being edited/deleted at the DB layer, not just the UI —
+matching the pattern M9 already established. User-created or -edited
+templates persist in that project's DB and travel with it.
 
 ## Scale-determination workflow (the core hard problem)
 Use multiple methods and cross-validate when more than one is available:
@@ -437,15 +443,13 @@ land-measure-tool/                # the application code itself
 │   ├── core/                    # pure Python, no UI imports — reusable in Phase 2
 │   │   ├── scale.py             # 4-method scale detection & cross-validation
 │   │   ├── geometry.py          # segment/perimeter/area calc
-│   │   ├── units.py             # SI-canonical storage + user-defined local unit profiles
+│   │   ├── units.py             # SI-canonical storage + built-in units (profiles stored in project_db)
 │   │   ├── polygon.py           # point/path/polygon data model (incl. optional lat/lon)
-│   │   ├── templates.py         # land-record field templates, load/save/apply
-│   │   └── project_db.py        # SQLite schema + read/write for one project folder
+│   │   ├── templates.py         # land-record field template logic (built-ins; storage lives in project_db)
+│   │   └── project_db.py        # SQLite schema + read/write for one project folder, incl. unit
+│   │                             #   profiles and land-type templates (both portable, per-project)
 │   └── export/
 │       └── report.py            # PDF/CSV/JSON summary generation
-├── config/
-│   ├── templates/                # rural-agri.json, rural-residential.json, urban.json
-│   └── unit_profiles/            # default/global unit conversion profiles
 ├── tests/
 ├── reference/                   # prior prototypes, kept for logic reference only
 │   ├── point_picker.html
@@ -456,7 +460,8 @@ land-measure-tool/                # the application code itself
 
 # a USER'S PROJECT (created/opened by the app, portable to a pen drive)
 some-parcel-project/
-├── project.db                    # single SQLite file: parcels, points, fields, unit profiles used
+├── project.db                    # single SQLite file: parcels, vertices, fields, unit
+│                                  #   profiles, and land-type templates — all portable
 ├── sources/                      # original PDFs/images/DXFs, referenced by relative path from project.db
 └── exports/                      # generated PDF/CSV/JSON summaries
 ```
