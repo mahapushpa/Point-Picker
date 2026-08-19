@@ -9,15 +9,16 @@
 # --- GUI (Milestone 2+) ---
 PySide6>=6.6            # native QGraphicsView canvas for pan/zoom/click
 
-# --- File I/O (Milestone 2, 8, 9) ---
-PyMuPDF>=1.24           # PDF render to raster + physical page size + PDF export
-ezdxf>=1.1              # DXF (not DWG) reading: header units/scale, entities
-Pillow>=10.0            # image loading, DPI metadata; median denoise (M8)
-numpy>=1.26             # array math; CLAHE contrast preprocessing (M8), detection (M10)
-opencv-python>=4.9      # grid/reference detection (M10) — not needed before then
+# --- File I/O (Milestone 2, 8, 14, 15) ---
+PyMuPDF>=1.24           # PDF render to raster + physical page size + PDF/report export
+ezdxf>=1.1              # DXF (not DWG): header units ($INSUNITS) + entity geometry (M15)
+Pillow>=10.0            # image loading, DPI metadata; median denoise (M8); DXF raster (M15)
+numpy>=1.26             # array math; CLAHE contrast preprocessing (M8), detection (M19)
+opencv-python>=4.9      # grid/reference detection (M19) — not needed before then
 
-# --- Export (Milestone 7) ---
-reportlab>=4.0          # alternative PDF summary writer (PyMuPDF can also write)
+# Note: DXF entities are rasterised with Pillow (already required above), so M15
+# adds no rendering dependency beyond ezdxf. reportlab was dropped after M11
+# settled on PyMuPDF for all PDF writing.
 
 # --- Dev / test (optional) ---
 pytest>=8.0             # tests also run under stdlib `python -m unittest`

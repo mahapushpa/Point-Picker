@@ -38,7 +38,8 @@ from ..core.geometry import measure_polygon
 from ..core.project_db import ProjectDB, ProjectError
 from ..core.scale import (
     compute_two_point_scale, compare_scales, metadata_scale_from_page,
-    TwoPointScale, METHOD_TWO_POINT, METHOD_PDF_METADATA,
+    dxf_header_scale, TwoPointScale, METHOD_TWO_POINT, METHOD_PDF_METADATA,
+    METHOD_DXF_HEADER,
 )
 from ..core.selection import parcel_at_point, parcels_in_rect
 from ..core import units
@@ -65,8 +66,9 @@ def _parcel_color(index: int) -> QColor:
     return QColor(_PARCEL_PALETTE[index % len(_PARCEL_PALETTE)])
 
 _FILE_FILTER = (
-    "Supported documents (*.pdf *.png *.jpg *.jpeg *.bmp *.tif *.tiff);;"
+    "Supported documents (*.pdf *.dxf *.png *.jpg *.jpeg *.bmp *.tif *.tiff);;"
     "PDF (*.pdf);;"
+    "DXF (*.dxf);;"
     "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;"
     "All files (*)"
 )
@@ -181,6 +183,10 @@ class MainWindow(QMainWindow):
         self._raw_raster = None
         self._pre_raster = None       # cached preprocessed raster (lazily built)
         self._preprocess_on = False
+        # DXF render metadata (Milestone 15): units + drawing-units-per-pixel of the
+        # current source, kept so the header-scale candidate can be offered. None
+        # for non-DXF sources.
+        self._dxf_info = None
 
         # Status bar: transient message on the left; permanent readouts right.
         self._status = QLabel("Open a PDF or image to begin.")
@@ -237,6 +243,15 @@ class MainWindow(QMainWindow):
         self._pdf_scale_action.triggered.connect(self.propose_pdf_metadata_scale)
         self._pdf_scale_action.setEnabled(False)   # enabled once a PDF is loaded
         bar.addAction(self._pdf_scale_action)
+
+        # DXF-header scale (Milestone 15): a second candidate for DXF sources.
+        self._dxf_scale_action = QAction("DXF scale", self)
+        self._dxf_scale_action.setToolTip(
+            "Derive a scale from this DXF's header units ($INSUNITS), and cross-check "
+            "it against the manual scale. DXF sources only; offered, never auto-applied.")
+        self._dxf_scale_action.triggered.connect(self.propose_dxf_header_scale)
+        self._dxf_scale_action.setEnabled(False)   # enabled once a DXF is loaded
+        bar.addAction(self._dxf_scale_action)
 
         bar.addSeparator()
         for text, tooltip, slot in (
@@ -1024,8 +1039,17 @@ class MainWindow(QMainWindow):
     def load_path(self, path) -> None:
         """Decode *path* and show it. If a project is open, register the file and
         restore any saved scale/boundary for it."""
+        dxf_info = None
         try:
-            raster = open_raster(path)
+            if Path(path).suffix.lower() == ".dxf":
+                # Render via the DXF loader directly so its header/scale metadata is
+                # captured; the resulting raster is the same neutral contract as any
+                # other source, so everything downstream is unchanged.
+                from ..io.dxf_loader import render_dxf
+                dxf_info = render_dxf(path)
+                raster = dxf_info.raster
+            else:
+                raster = open_raster(path)
         except Exception as exc:  # decoding errors are user-facing, not crashes
             QMessageBox.critical(self, "Could not open file", f"{Path(path).name}\n\n{exc}")
             self._status.setText("Open a PDF or image to begin.")
@@ -1034,6 +1058,7 @@ class MainWindow(QMainWindow):
         self._set_select_checked(False)
         self._reset_review_controls()   # canvas reset its overlay state; mirror it in the UI
         self._raw_raster = raster
+        self._dxf_info = dxf_info
         self._pre_raster = None         # invalidate any cached enhancement
         self._current_path = str(path)
         self._source_id = None
@@ -1043,10 +1068,15 @@ class MainWindow(QMainWindow):
         self._selected_parcel_ids.clear()   # selection is per-source; start fresh
         self._apply_display_image()     # honour the preprocessing toggle for the new file
         self._sync_pdf_scale_action()   # PDF-metadata scale is offered for PDFs only
+        self._sync_dxf_scale_action()   # DXF-header scale is offered for DXFs only
         self._attach_source_to_project()
         self._update_scale_readout()
         self._update_measure_readout()
-        self._status.setText(f"{Path(path).name}   —   {raster.width} × {raster.height} px")
+        msg = f"{Path(path).name}   —   {raster.width} × {raster.height} px"
+        if dxf_info is not None and dxf_info.skipped_entity_types:
+            # Flag, never silently drop, entity types we don't render (M15 scope).
+            msg += f"   (DXF: not drawn — {', '.join(dxf_info.skipped_entity_types)})"
+        self._status.setText(msg)
         self._update_title()
 
     # -- image preprocessing (Milestone 8) ----------------------------------
@@ -1206,21 +1236,84 @@ class MainWindow(QMainWindow):
                 self._status.setText("PDF-metadata scale not applied.")
 
     def _apply_metadata_scale(self, meta) -> None:
-        """Adopt a metadata scale candidate as the source's scale (only ever from
-        an explicit user confirmation in :meth:`propose_pdf_metadata_scale`)."""
+        """Adopt a PDF-metadata scale candidate (only from an explicit confirmation
+        in :meth:`propose_pdf_metadata_scale`)."""
+        self._apply_candidate_scale(
+            meta.metres_per_pixel, METHOD_PDF_METADATA, "PDF metadata",
+            note=f"PDF page {meta.width_pt:.0f}x{meta.height_pt:.0f} pt "
+                 f"({meta.width_m:.3f}x{meta.height_m:.3f} m)")
+
+    def _apply_candidate_scale(self, metres_per_pixel: float, method: str,
+                               label: str, *, note: str) -> None:
+        """Adopt a derived (non-manual) scale candidate as the source's scale.
+        Shared by the PDF-metadata (M14) and DXF-header (M15) offers — both only
+        ever reach here on an explicit user confirmation."""
         self._scale = TwoPointScale(
             p1=(0.0, 0.0), p2=(0.0, 0.0), pixel_distance=0.0, real_distance_m=0.0,
-            metres_per_pixel=meta.metres_per_pixel, method=METHOD_PDF_METADATA)
+            metres_per_pixel=metres_per_pixel, method=method)
         if self._project is not None and self._source_id is not None:
             self._project.set_source_scale(
-                self._source_id, meta.metres_per_pixel, method=METHOD_PDF_METADATA,
-                note=f"PDF page {meta.width_pt:.0f}x{meta.height_pt:.0f} pt "
-                     f"({meta.width_m:.3f}x{meta.height_m:.3f} m)")
-            self._project.refresh_source_vertices_si(self._source_id, meta.metres_per_pixel)
+                self._source_id, metres_per_pixel, method=method, note=note)
+            self._project.refresh_source_vertices_si(self._source_id, metres_per_pixel)
         self._update_scale_readout()
         self._update_measure_readout()
-        self._status.setText(
-            f"Scale set from PDF metadata: 1 px = {meta.metres_per_pixel:.4g} m.")
+        self._status.setText(f"Scale set from {label}: 1 px = {metres_per_pixel:.4g} m.")
+
+    # -- DXF-header scale (Milestone 15) ------------------------------------
+
+    def _current_is_dxf(self) -> bool:
+        return (self._current_path is not None
+                and Path(self._current_path).suffix.lower() == ".dxf")
+
+    def _sync_dxf_scale_action(self) -> None:
+        """Enable the DXF-header scale action only for DXF sources."""
+        self._dxf_scale_action.setEnabled(self._current_is_dxf() and self._dxf_info is not None)
+
+    def propose_dxf_header_scale(self) -> None:
+        """Offer a DXF-header-derived scale (method 1 for DXF). Like the PDF offer:
+        cross-checked against a manual scale when one exists, applied only on an
+        explicit confirmation, never silently."""
+        if not self._current_is_dxf() or self._dxf_info is None:
+            QMessageBox.information(
+                self, "Not a DXF",
+                "DXF-header scale is only available for DXF sources.")
+            return
+        try:
+            cand = dxf_header_scale(self._dxf_info.insunits, self._dxf_info.units_per_pixel)
+        except ValueError as exc:   # unitless / unknown $INSUNITS
+            QMessageBox.information(
+                self, "No usable DXF units",
+                f"This DXF's header carries no real-world unit:\n\n{exc}\n\n"
+                "Use the manual two-point scale instead.")
+            return
+
+        manual = self._manual_scale()
+        cand_line = (f"DXF header unit: {cand.unit_name} ({cand.metres_per_unit:g} m/unit)\n"
+                     f"→ DXF-header scale: 1 px = {cand.metres_per_pixel:.4g} m")
+        if manual is not None:
+            cc = compare_scales(manual.metres_per_pixel, cand.metres_per_pixel)
+            body = (f"Manual scale: 1 px = {manual.metres_per_pixel:.4g} m\n"
+                    f"{cand_line}\n\n{cc.describe()}\n\n"
+                    "Replace the manual scale with the DXF-header scale?")
+            if QMessageBox.question(self, "Two scales — cross-check", body) \
+                    == QMessageBox.StandardButton.Yes:
+                self._apply_dxf_scale(cand)
+            else:
+                self._status.setText("Kept manual scale. " + cc.describe())
+        else:
+            body = (f"{cand_line}\n\nUse it as this source's scale?\n"
+                    "(You can still set a manual scale instead.)")
+            if QMessageBox.question(self, "Scale from DXF header", body) \
+                    == QMessageBox.StandardButton.Yes:
+                self._apply_dxf_scale(cand)
+            else:
+                self._status.setText("DXF-header scale not applied.")
+
+    def _apply_dxf_scale(self, cand) -> None:
+        self._apply_candidate_scale(
+            cand.metres_per_pixel, METHOD_DXF_HEADER, "DXF header",
+            note=f"DXF $INSUNITS={cand.insunits} ({cand.unit_name}), "
+                 f"{cand.units_per_pixel:.6g} unit/px")
 
     # -- polygon tracing ----------------------------------------------------
 
@@ -1664,7 +1757,11 @@ class MainWindow(QMainWindow):
             self._scale_readout.setText("Scale: not set")
         else:
             s = self._scale
-            source = " [PDF metadata]" if s.method == METHOD_PDF_METADATA else ""
+            source = ""
+            if s.method == METHOD_PDF_METADATA:
+                source = " [PDF metadata]"
+            elif s.method == METHOD_DXF_HEADER:
+                source = " [DXF header]"
             self._scale_readout.setText(
                 f"Scale: 1 px = {s.metres_per_pixel:.4g} m   "
                 f"(1 m = {s.pixels_per_metre:.4g} px){source}")

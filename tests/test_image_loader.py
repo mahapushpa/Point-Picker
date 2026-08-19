@@ -68,8 +68,9 @@ class ImageLoaderTests(unittest.TestCase):
         self.assertEqual((r.width, r.height), (3, 3))
 
     def test_open_raster_rejects_unknown_extension(self):
+        # .dxf became a supported source in M15; use a genuinely unknown extension.
         with self.assertRaises(ValueError):
-            open_raster(self.tmp / "x.dxf")
+            open_raster(self.tmp / "x.xyz")
 
 
 if __name__ == "__main__":

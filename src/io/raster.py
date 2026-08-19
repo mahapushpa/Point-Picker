@@ -46,6 +46,7 @@ class RasterImage:
 # Extensions each loader claims. Mirrors _guess_file_type in core.project_db but
 # is scoped to what Milestone 2 can actually render.
 _PDF_EXTS = {".pdf"}
+_DXF_EXTS = {".dxf"}
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
 
@@ -63,6 +64,9 @@ def open_raster(path, **kwargs) -> RasterImage:
     if ext in _PDF_EXTS:
         from .pdf_loader import load_pdf_page
         return load_pdf_page(path, **kwargs)
+    if ext in _DXF_EXTS:
+        from .dxf_loader import load_dxf_page
+        return load_dxf_page(path, **kwargs)
     if ext in _IMAGE_EXTS:
         from .image_loader import load_image
         return load_image(path)

@@ -23,6 +23,7 @@ Point = tuple[float, float]
 #: honest about which one produced a given number.
 METHOD_TWO_POINT = "two-point"
 METHOD_PDF_METADATA = "pdf-metadata"
+METHOD_DXF_HEADER = "dxf-header"
 
 #: Unit conversions for reading a PDF's physical page size. A PDF user-space unit
 #: is the point = 1/72 inch; an inch is exactly 0.0254 m.
@@ -171,6 +172,93 @@ class ScaleCrossCheck:
         return (f"Manual and PDF-metadata scales DISAGREE by "
                 f"{self.percent_difference:.1f}% (more than {self.tolerance_percent:g}%) — "
                 "check which one is right before trusting measurements.")
+
+
+# -- method 1 (DXF): header-units scale (Milestone 15) ----------------------
+#
+# A DXF stores geometry in real drawing units and records which unit via the
+# $INSUNITS header variable. Unlike the PDF 1:1 assumption, this is an exact
+# real-world size when $INSUNITS names a real unit — so rendering the drawing at
+# a known drawing-units-per-pixel yields a reliable metres-per-pixel candidate.
+
+#: AutoCAD $INSUNITS code -> metres per drawing unit (the common real-world units;
+#: 0 = unitless and any code absent here yields "no reliable unit").
+INSUNITS_TO_METRES = {
+    1: 0.0254,            # inches
+    2: 0.3048,            # feet
+    3: 1609.344,          # miles
+    4: 0.001,             # millimetres
+    5: 0.01,              # centimetres
+    6: 1.0,               # metres
+    7: 1000.0,            # kilometres
+    8: 0.0254e-6,         # microinches
+    9: 0.0254e-3,         # mils
+    10: 0.9144,           # yards
+    11: 1e-10,            # angstroms
+    12: 1e-9,             # nanometres
+    13: 1e-6,             # microns
+    14: 0.1,              # decimetres
+    15: 10.0,             # decametres
+    16: 100.0,            # hectometres
+    21: 1200.0 / 3937.0,  # US survey feet
+}
+
+#: Human-readable names for the codes we understand (for readouts / notes).
+INSUNITS_NAMES = {
+    0: "unitless", 1: "inches", 2: "feet", 3: "miles", 4: "millimetres",
+    5: "centimetres", 6: "metres", 7: "kilometres", 8: "microinches", 9: "mils",
+    10: "yards", 11: "angstroms", 12: "nanometres", 13: "microns",
+    14: "decimetres", 15: "decametres", 16: "hectometres", 21: "US survey feet",
+}
+
+
+def metres_per_unit_from_insunits(insunits: int) -> float:
+    """Metres per drawing unit for a DXF ``$INSUNITS`` code.
+
+    Raises ``ValueError`` for 0 (unitless) or any code we don't map to a real unit
+    — in those cases the drawing carries no reliable real-world scale and the
+    candidate must not be offered.
+    """
+    factor = INSUNITS_TO_METRES.get(int(insunits))
+    if factor is None:
+        name = INSUNITS_NAMES.get(int(insunits), "unknown")
+        raise ValueError(
+            f"DXF $INSUNITS={insunits} ({name}) carries no usable real-world unit; "
+            "cannot derive a scale from the header")
+    return factor
+
+
+@dataclass(frozen=True)
+class DxfHeaderScale:
+    """A scale candidate derived from a DXF's header units and the render's
+    drawing-units-per-pixel (method 1 for DXF sources, Milestone 15)."""
+
+    insunits: int
+    unit_name: str
+    metres_per_unit: float
+    units_per_pixel: float
+    metres_per_pixel: float
+    method: str = METHOD_DXF_HEADER
+
+    @property
+    def pixels_per_metre(self) -> float:
+        return 1.0 / self.metres_per_pixel
+
+
+def dxf_header_scale(insunits: int, units_per_pixel: float) -> DxfHeaderScale:
+    """Combine a DXF header unit with the render's drawing-units-per-pixel into a
+    metres-per-pixel candidate. Raises ``ValueError`` for a unitless/unknown header
+    or a non-positive units-per-pixel."""
+    if units_per_pixel <= 0:
+        raise ValueError(f"units_per_pixel must be positive, got {units_per_pixel}")
+    metres_per_unit = metres_per_unit_from_insunits(insunits)
+    return DxfHeaderScale(
+        insunits=int(insunits),
+        unit_name=INSUNITS_NAMES.get(int(insunits), "unknown"),
+        metres_per_unit=metres_per_unit,
+        units_per_pixel=float(units_per_pixel),
+        metres_per_pixel=metres_per_unit * float(units_per_pixel),
+    )
 
 
 def compare_scales(manual_mpp: float, metadata_mpp: float, *,
