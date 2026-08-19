@@ -216,9 +216,23 @@ purpose:
    report generation.
 3. **Visual confidence overlay.** Before trusting a report, the user should
    be able to see the traced boundary drawn directly over the source scan,
-   selectable/toggleable per parcel, so overlap/misalignment is visible at
-   a glance rather than trusted blindly. This is a review step, not a
-   report format — likely a canvas mode rather than an export.
+   toggleable per parcel, so overlap/misalignment is visible at a glance
+   rather than trusted blindly. This is a review step, not a report format —
+   a canvas display mode rather than an export. Parcels are already drawn
+   over the scan by default (M4/M5's active/selected/background states); the
+   review layer adds three display-only controls on top, none of which touch
+   stored geometry, the active parcel, the selection, or the current
+   tool/mode:
+   - a **global hide/show of all overlays**, to compare the bare scan against
+     what's traced, independent of whatever edit mode is active — toggling it
+     never exits that mode or loses state;
+   - a **per-parcel visibility toggle** that genuinely hides one parcel's
+     overlay (distinct from M5's active look and M7's selected look), to
+     declutter a busy sheet down to the parcels under review;
+   - **adjustable overlay opacity**, to fade the boundary against faint scan
+     detail and spot subtle misalignment.
+   Usable any time as a review mode, not only just before generating an
+   M11/M12 report.
 
 All exports: PDF (primary, shareable) and CSV/JSON (record-keeping /
 import elsewhere). Each report also carries: scale-determination method

@@ -158,6 +158,21 @@ class CanvasView(QGraphicsView):
         self._seg_hover_edge: int | None = None
         self.EDGE_HIT_RADIUS = 8   # px around an edge that counts as clicking it
 
+        # Visual confidence overlay (Milestone 13) — review-time DISPLAY controls
+        # only. None of these touch stored geometry, the active parcel, the
+        # selection, or the current mode; they change only what is drawn over the
+        # scan so a trace can be checked against it:
+        #   * `_overlays_visible` — global raw-scan toggle (hide everything drawn);
+        #   * `_overlay_opacity`  — fade all boundary overlays (0..1);
+        #   * `_hidden_parcel_ids`— genuinely drop individual parcels (active or
+        #     not), distinct from the muted background look and from selection;
+        #   * `_active_parcel_id` — which parcel the editable boundary belongs to,
+        #     so per-parcel hiding can apply to it too (backgrounds carry their ids).
+        self._overlays_visible = True
+        self._overlay_opacity = 1.0
+        self._hidden_parcel_ids: set[int] = set()
+        self._active_parcel_id: int | None = None
+
         # Precision crosshair.
         self._crosshair_enabled = False
         self._cursor_vp_pos = None  # QPoint in viewport coords, or None
@@ -194,6 +209,11 @@ class CanvasView(QGraphicsView):
         self._seg_selected.clear()
         self._seg_items.clear()
         self._seg_hover_edge = None
+        # Reset the review-overlay display to defaults for the new source.
+        self._overlays_visible = True
+        self._overlay_opacity = 1.0
+        self._hidden_parcel_ids.clear()
+        self._active_parcel_id = None
         self._active = None
         self._drag_kind = self._drag_index = None
         self._pixmap_item = self._scene.addPixmap(pixmap)
@@ -416,10 +436,14 @@ class CanvasView(QGraphicsView):
 
     def _redraw_backgrounds(self) -> None:
         self._remove_items(self._bg_items)
+        if not self._overlays_visible:
+            return
         for poly in self._bg_polys:
             qpts = poly["points"]
             if not qpts:
                 continue
+            if poly["parcel_id"] is not None and poly["parcel_id"] in self._hidden_parcel_ids:
+                continue   # per-parcel overlay hidden (Milestone 13), regardless of state
             selected = poly["parcel_id"] is not None and poly["parcel_id"] in self._selected_ids
             if selected and len(qpts) >= 3:
                 # Selected-but-not-active: a translucent fill (unique to this
@@ -455,6 +479,7 @@ class CanvasView(QGraphicsView):
                 text.setZValue(2)
                 self._scene.addItem(text)
                 self._bg_items.append(text)
+        self._apply_opacity(self._bg_items)
 
     # -- boundary-segment selection (Milestone 12) --------------------------
     #
@@ -550,6 +575,8 @@ class CanvasView(QGraphicsView):
         self._remove_items(self._seg_items)
         if not self._segmenting:
             return
+        if not self._overlays_visible or self._active_overlay_hidden():
+            return   # segments belong to the active parcel; hidden with it (M13)
         by_index = {i: (a, b) for i, a, b in self._edge_list()}
         # Hovered (not-yet-selected) edge: a faint highlight cue.
         if self._seg_hover_edge is not None and self._seg_hover_edge not in self._seg_selected \
@@ -570,6 +597,7 @@ class CanvasView(QGraphicsView):
             label.setZValue(8)
             self._scene.addItem(label)
             self._seg_items.append(label)
+        self._apply_opacity(self._seg_items)
 
     def _add_segment_line(self, a: QPointF, b: QPointF, color: QColor, width: int) -> None:
         pen = QPen(color)
@@ -580,6 +608,84 @@ class CanvasView(QGraphicsView):
         line.setZValue(7)   # above the active boundary (5), below markers (10)
         self._scene.addItem(line)
         self._seg_items.append(line)
+
+    # -- visual confidence overlay (Milestone 13) ---------------------------
+    #
+    # Review-only display controls: a way to compare what's traced against the
+    # raw scan underneath. Every method here re-renders overlay layers and
+    # nothing else — the traced points, vertex ids, active parcel, selection, and
+    # the current mode (calibrating / tracing / selecting / segmenting) are left
+    # exactly as they were, so these are safe to toggle mid-edit.
+
+    def set_overlays_visible(self, visible: bool) -> None:
+        """Global show/hide of everything drawn over the scan (all parcels, the
+        active boundary, segment highlights, calibration markers, crosshair) so the
+        bare scan can be compared against the trace. A pure display toggle: it does
+        not exit any mode or drop any state."""
+        self._overlays_visible = bool(visible)
+        self._apply_overlay_display()
+
+    def overlays_visible(self) -> bool:
+        return self._overlays_visible
+
+    def toggle_overlays(self) -> None:
+        self.set_overlays_visible(not self._overlays_visible)
+
+    def set_overlay_opacity(self, factor: float) -> None:
+        """Opacity (0..1) of the boundary overlays, so a trace can be faded to
+        spot misalignment against faint scan detail. Visual only."""
+        self._overlay_opacity = max(0.0, min(1.0, float(factor)))
+        self._apply_overlay_display()
+
+    def overlay_opacity(self) -> float:
+        return self._overlay_opacity
+
+    def set_active_parcel_id(self, parcel_id) -> None:
+        """Tell the canvas which parcel the active/editable boundary belongs to, so
+        per-parcel hiding can apply to it as well as to background parcels."""
+        self._active_parcel_id = None if parcel_id is None else int(parcel_id)
+        self._redraw_polygon()
+        self._redraw_segments()
+
+    def set_parcel_hidden(self, parcel_id, hidden: bool) -> None:
+        """Genuinely hide/show one parcel's overlay — distinct from the muted
+        background look and independent of its active/selected state. Visual only."""
+        pid = int(parcel_id)
+        if hidden:
+            self._hidden_parcel_ids.add(pid)
+        else:
+            self._hidden_parcel_ids.discard(pid)
+        self._apply_overlay_display()
+
+    def set_hidden_parcel_ids(self, ids) -> None:
+        self._hidden_parcel_ids = {int(i) for i in ids}
+        self._apply_overlay_display()
+
+    def is_parcel_hidden(self, parcel_id) -> bool:
+        return int(parcel_id) in self._hidden_parcel_ids
+
+    def hidden_parcel_ids(self) -> set[int]:
+        return set(self._hidden_parcel_ids)
+
+    def _active_overlay_hidden(self) -> bool:
+        return (self._active_parcel_id is not None
+                and self._active_parcel_id in self._hidden_parcel_ids)
+
+    def _apply_overlay_display(self) -> None:
+        """Re-render every overlay layer honouring the current visibility / opacity
+        / per-parcel-hidden settings. Touches no stored geometry or mode."""
+        self._redraw_backgrounds()
+        self._redraw_polygon()
+        self._redraw_segments()
+        self._redraw_calibration()
+        self.viewport().update()   # crosshair is painted in drawForeground
+
+    def _apply_opacity(self, bucket: list) -> None:
+        """Fade the just-drawn items in *bucket* to the review opacity (a no-op at
+        full opacity, so normal editing is pixel-for-pixel unchanged)."""
+        if self._overlay_opacity != 1.0:
+            for item in bucket:
+                item.setOpacity(self._overlay_opacity)
 
     # -- shared pick: confirm / cancel / crosshair --------------------------
 
@@ -934,6 +1040,9 @@ class CanvasView(QGraphicsView):
     def _update_snap_indicator(self, scene_pt: QPointF) -> None:
         """Show a magenta ring on the vertex the next click would snap to, so the
         snap is never a surprise. Hidden when no candidate is in range."""
+        if not self._overlays_visible:
+            self._clear_snap_indicator()
+            return
         snap = self._snap_target((scene_pt.x(), scene_pt.y()))
         if snap is None:
             self._clear_snap_indicator()
@@ -989,6 +1098,8 @@ class CanvasView(QGraphicsView):
 
     def _redraw_calibration(self) -> None:
         self._remove_items(self._calib_items)
+        if not self._overlays_visible:
+            return   # review overlay hidden (Milestone 13); picked points are kept
         pts = self._calib_points
         if len(pts) == 2:
             pen = QPen(_MARK_COLOR)
@@ -1005,6 +1116,8 @@ class CanvasView(QGraphicsView):
 
     def _redraw_polygon(self) -> None:
         self._remove_items(self._poly_items)
+        if not self._overlays_visible or self._active_overlay_hidden():
+            return   # review overlay hidden (Milestone 13); geometry is untouched
         pts = self._poly_points
         color = self._active_color
         edge = QPen(color)
@@ -1030,6 +1143,7 @@ class CanvasView(QGraphicsView):
             active = self._active == ("poly", i)
             self._add_marker(self._poly_items, p, str(i + 1), color,
                              filled=True, active=active)
+        self._apply_opacity(self._poly_items)
 
     def _redraw_active(self) -> None:
         """Refresh only the highlight after selection changes (cheap enough to
@@ -1080,7 +1194,8 @@ class CanvasView(QGraphicsView):
 
     def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
         super().drawForeground(painter, rect)
-        if not (self._crosshair_enabled and self.is_picking() and self._cursor_vp_pos is not None):
+        if not (self._overlays_visible and self._crosshair_enabled and self.is_picking()
+                and self._cursor_vp_pos is not None):
             return
         x, y = self._cursor_vp_pos.x(), self._cursor_vp_pos.y()
         w, h = self.viewport().width(), self.viewport().height()

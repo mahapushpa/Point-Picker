@@ -29,8 +29,8 @@ from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QDockWidget, QFileDialog, QHBoxLayout, QHeaderView,
     QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QToolBar,
-    QVBoxLayout, QWidget,
+    QMenu, QMessageBox, QPushButton, QSlider, QTableWidget, QTableWidgetItem,
+    QToolBar, QVBoxLayout, QWidget,
 )
 
 from ..core.geometry import measure_polygon
@@ -126,6 +126,7 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_toolbar()
         self._build_units_toolbar()
+        self._build_review_toolbar()
         self._build_parcel_dock()
         self._build_segment_dock()
 
@@ -206,6 +207,114 @@ class MainWindow(QMainWindow):
         bar.addAction(manage)
         self._refresh_unit_combo()
 
+    def _build_review_toolbar(self) -> None:
+        """Visual confidence overlay (Milestone 13): a review row for checking a
+        trace against the scan underneath — a global show/hide of every overlay and
+        an opacity fade. (Per-parcel hiding lives on the Parcels list: right-click a
+        parcel.) Everything here is display-only; it never changes geometry, the
+        active parcel, the selection, or the current tool/mode."""
+        bar = QToolBar("Review", self)
+        bar.setMovable(False)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, bar)
+
+        self._overlays_action = QAction("Overlays", self, checkable=True)
+        self._overlays_action.setChecked(True)
+        self._overlays_action.setToolTip(
+            "Show/hide ALL overlays to compare the trace against the raw scan. "
+            "A display toggle only — it does not leave the current tool or lose work.")
+        self._overlays_action.toggled.connect(self._on_overlays_toggled)
+        bar.addAction(self._overlays_action)
+
+        bar.addSeparator()
+        bar.addWidget(QLabel(" Overlay opacity: "))
+        self._opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self._opacity_slider.setMinimum(10)      # never fully invisible via the slider
+        self._opacity_slider.setMaximum(100)
+        self._opacity_slider.setValue(100)
+        self._opacity_slider.setFixedWidth(120)
+        self._opacity_slider.setToolTip(
+            "Fade the traced boundaries against the scan to spot subtle "
+            "misalignment. Purely visual — geometry is unchanged.")
+        self._opacity_slider.valueChanged.connect(self._on_opacity_changed)
+        bar.addWidget(self._opacity_slider)
+        self._opacity_label = QLabel("100%")
+        bar.addWidget(self._opacity_label)
+
+        bar.addSeparator()
+        self._show_all_parcels_act = QAction("Show all parcels", self)
+        self._show_all_parcels_act.setToolTip(
+            "Un-hide every parcel overlay hidden via the Parcels list.")
+        self._show_all_parcels_act.triggered.connect(self.show_all_parcel_overlays)
+        bar.addAction(self._show_all_parcels_act)
+
+        # Mirror the review controls in a menu for discoverability (built here,
+        # after the actions exist).
+        review_menu = self.menuBar().addMenu("Re&view")
+        review_menu.addAction(self._overlays_action)
+        review_menu.addAction(self._show_all_parcels_act)
+
+    def _on_overlays_toggled(self, checked: bool) -> None:
+        # Display-only: never changes the active tool/mode or any stored data.
+        self.canvas.set_overlays_visible(checked)
+        self._status.setText(
+            "Overlays shown." if checked
+            else "Overlays hidden — showing the raw scan for comparison.")
+
+    def _on_opacity_changed(self, value: int) -> None:
+        self._opacity_label.setText(f"{value}%")
+        self.canvas.set_overlay_opacity(value / 100.0)
+
+    def _reset_review_controls(self) -> None:
+        """Sync the review toolbar back to defaults (all shown, full opacity) —
+        used when a new source is loaded, whose canvas overlay state also resets."""
+        self._overlays_action.blockSignals(True)
+        self._overlays_action.setChecked(True)
+        self._overlays_action.blockSignals(False)
+        self._opacity_slider.blockSignals(True)
+        self._opacity_slider.setValue(100)
+        self._opacity_slider.blockSignals(False)
+        self._opacity_label.setText("100%")
+
+    def show_all_parcel_overlays(self) -> None:
+        """Clear every per-parcel overlay hide (Milestone 13)."""
+        self.canvas.set_hidden_parcel_ids([])
+        self._refresh_parcel_visibility_cues()
+
+    def toggle_parcel_overlay(self, parcel_id) -> None:
+        """Hide/show one parcel's overlay for review (Milestone 13). Independent of
+        which parcel is active or selected — a pure display state on the canvas."""
+        now_hidden = not self.canvas.is_parcel_hidden(parcel_id)
+        self.canvas.set_parcel_hidden(parcel_id, now_hidden)
+        self._refresh_parcel_visibility_cues()
+
+    def _on_parcel_context_menu(self, pos) -> None:
+        item = self._parcel_list.itemAt(pos)
+        if item is None:
+            return
+        pid = item.data(Qt.ItemDataRole.UserRole)
+        hidden = self.canvas.is_parcel_hidden(pid)
+        menu = QMenu(self._parcel_list)
+        toggle = menu.addAction("Show overlay" if hidden else "Hide overlay")
+        chosen = menu.exec(self._parcel_list.viewport().mapToGlobal(pos))
+        if chosen is toggle:
+            self.toggle_parcel_overlay(pid)
+
+    def _refresh_parcel_visibility_cues(self) -> None:
+        """Reflect each parcel's overlay-hidden state in its list row (a dimmed,
+        '(overlay hidden)'-suffixed label), without disturbing the active row."""
+        self._parcel_list.blockSignals(True)
+        for row in range(self._parcel_list.count()):
+            item = self._parcel_list.item(row)
+            pid = item.data(Qt.ItemDataRole.UserRole)
+            hidden = self.canvas.is_parcel_hidden(pid)
+            item.setText(self._parcel_label(row, self._parcels[row])
+                         + ("  (overlay hidden)" if hidden else ""))
+            color = QColor(_parcel_color(row))
+            if hidden:
+                color.setAlpha(90)
+            item.setForeground(color)
+        self._parcel_list.blockSignals(False)
+
     def _build_parcel_dock(self) -> None:
         """Sidebar listing the current source's parcels: select the active one,
         add/delete, and edit its owner. Only meaningful with a project open."""
@@ -221,6 +330,12 @@ class MainWindow(QMainWindow):
         # the selection working set. Two independent states in one list.
         self._parcel_list.currentRowChanged.connect(self._on_parcel_row_changed)
         self._parcel_list.itemChanged.connect(self._on_parcel_item_changed)
+        # Right-click a parcel to hide/show just its overlay (Milestone 13 review).
+        self._parcel_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._parcel_list.customContextMenuRequested.connect(self._on_parcel_context_menu)
+        self._parcel_list.setToolTip(
+            "Click a parcel to edit it; tick its box to add it to the selection; "
+            "right-click to hide/show just its overlay (review).")
         layout.addWidget(self._parcel_list, 1)
 
         buttons = QHBoxLayout()
@@ -539,6 +654,7 @@ class MainWindow(QMainWindow):
                                else Qt.CheckState.Unchecked)
             self._parcel_list.addItem(item)
         self._parcel_list.blockSignals(False)
+        self._refresh_parcel_visibility_cues()   # reflect any per-parcel overlay hides
 
     def _parcel_label(self, index: int, parcel: dict) -> str:
         owner = parcel.get("owner") or "(no owner)"
@@ -548,6 +664,10 @@ class MainWindow(QMainWindow):
 
     def _set_active_parcel(self, parcel_id: int | None) -> None:
         self._active_parcel_id = parcel_id
+        # Let the canvas know which parcel owns the editable boundary, so a
+        # per-parcel overlay hide (M13) can apply to it too — set before the
+        # polygon is (re)drawn below.
+        self.canvas.set_active_parcel_id(parcel_id)
         if parcel_id is None:
             self.canvas.set_polygon([], closed=False)
             self.canvas.set_background_polygons([])
@@ -807,6 +927,7 @@ class MainWindow(QMainWindow):
             return
         self.canvas.set_image(raster)   # clears any prior markers/boundary + exits selection mode
         self._set_select_checked(False)
+        self._reset_review_controls()   # canvas reset its overlay state; mirror it in the UI
         self._raw_raster = raster
         self._pre_raster = None         # invalidate any cached enhancement
         self._current_path = str(path)
