@@ -49,8 +49,10 @@ from .units import BUILTIN_AREA_UNITS
 #: adds ``sources.unit_profile_id`` — the local area-unit profile selected for
 #: display on that source — a purely additive nullable column. v7 (Milestone 10)
 #: adds the ``templates`` + ``template_fields`` tables (built-in + user land-type
-#: templates), purely additive (new tables via CREATE TABLE IF NOT EXISTS).
-SCHEMA_VERSION = 7
+#: templates), purely additive (new tables via CREATE TABLE IF NOT EXISTS). v8
+#: (Milestone 16) adds the ``location_fixes`` table (per-parcel landmark
+#: distance/bearing observations), likewise purely additive.
+SCHEMA_VERSION = 8
 
 DB_FILENAME = "project.db"
 SOURCES_DIRNAME = "sources"
@@ -191,6 +193,29 @@ CREATE TABLE IF NOT EXISTS source_scales (
     note             TEXT,                      -- confidence / cross-check note
     updated_at       TEXT    NOT NULL
 );
+
+-- Location-fixing (Milestone 16): per-parcel reference-landmark observations for
+-- distance/trigonometry mode. Each row is one landmark marked on the sheet with a
+-- distance (+ optional bearing) to a target boundary point. Pixel coordinates are
+-- relative to the source raster (like vertices); metres are derived via the
+-- source scale at read time, never stored redundantly. `source` is 'sheet'
+-- (distance/bearing computed from a marked target) or 'field' (user-supplied
+-- measurement, target computed by trig). `target_x/target_y` is the marked or
+-- implied target pixel (NULL for a distance-only field observation).
+CREATE TABLE IF NOT EXISTS location_fixes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    parcel_id  INTEGER NOT NULL REFERENCES parcels(id) ON DELETE CASCADE,
+    label      TEXT    NOT NULL,               -- landmark name (e.g. 'tubewell')
+    ref_x      REAL    NOT NULL,               -- reference landmark pixel
+    ref_y      REAL    NOT NULL,
+    distance_m REAL    NOT NULL,               -- real-world distance to target
+    bearing_deg REAL,                          -- M12 screen-up-North bearing (NULL if unknown)
+    target_x   REAL,                           -- marked/implied target pixel (NULL if distance-only)
+    target_y   REAL,
+    source     TEXT    NOT NULL,               -- 'sheet' | 'field'
+    created_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_location_fixes_parcel ON location_fixes(parcel_id);
 """
 
 #: Seeded on project creation. Universally correct, region-neutral units only.
@@ -522,6 +547,52 @@ class ProjectDB:
     def clear_source_scale(self, source_id: int) -> None:
         """Remove any stored scale for a source (used when re-calibrating)."""
         self.conn.execute("DELETE FROM source_scales WHERE source_id = ?", (source_id,))
+        self.conn.commit()
+
+    # -- location fixes (Milestone 16) --------------------------------------
+    #
+    # Per-parcel landmark observations for distance/trigonometry location-fixing.
+    # Pixel coordinates only (metres are derived via the source scale at read
+    # time); attaches to a parcel so a future report can read it. No scale is
+    # stored here — location-fixing reuses the source scale.
+
+    def add_location_fix(self, parcel_id: int, label: str, ref: tuple[float, float],
+                         distance_m: float, *, bearing_deg: float | None = None,
+                         target: tuple[float, float] | None = None,
+                         source: str = "field") -> int:
+        """Record one reference-landmark observation for a parcel. Returns its id."""
+        if self.conn.execute("SELECT 1 FROM parcels WHERE id = ?", (parcel_id,)).fetchone() is None:
+            raise ProjectError(f"No parcel with id {parcel_id} in this project.")
+        if source not in ("sheet", "field"):
+            raise ProjectError(f"location-fix source must be 'sheet' or 'field', got {source!r}")
+        tx, ty = (target if target is not None else (None, None))
+        cur = self.conn.execute(
+            "INSERT INTO location_fixes "
+            "(parcel_id, label, ref_x, ref_y, distance_m, bearing_deg, target_x, target_y, "
+            " source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (parcel_id, str(label), float(ref[0]), float(ref[1]), float(distance_m),
+             None if bearing_deg is None else float(bearing_deg),
+             None if tx is None else float(tx), None if ty is None else float(ty),
+             source, _utcnow()),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def list_location_fixes(self, parcel_id: int) -> list[dict]:
+        """All location-fix observations for a parcel, oldest first."""
+        rows = self.conn.execute(
+            "SELECT id, parcel_id, label, ref_x, ref_y, distance_m, bearing_deg, "
+            "target_x, target_y, source, created_at FROM location_fixes "
+            "WHERE parcel_id = ? ORDER BY id", (parcel_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_location_fix(self, fix_id: int) -> None:
+        self.conn.execute("DELETE FROM location_fixes WHERE id = ?", (fix_id,))
+        self.conn.commit()
+
+    def clear_location_fixes(self, parcel_id: int) -> None:
+        self.conn.execute("DELETE FROM location_fixes WHERE parcel_id = ?", (parcel_id,))
         self.conn.commit()
 
     # -- unit profiles (Milestone 9) ----------------------------------------

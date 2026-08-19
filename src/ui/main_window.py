@@ -41,6 +41,10 @@ from ..core.scale import (
     dxf_header_scale, TwoPointScale, METHOD_TWO_POINT, METHOD_PDF_METADATA,
     METHOD_DXF_HEADER,
 )
+from ..core.location import (
+    observation_from_points, target_from_field, format_description,
+    cross_validate_positions, SOURCE_FIELD, SOURCE_SHEET,
+)
 from ..core.selection import parcel_at_point, parcels_in_rect
 from ..core import units
 from ..export import report as report_export
@@ -154,6 +158,7 @@ class MainWindow(QMainWindow):
         self.canvas.marqueeSelected.connect(self._on_marquee_selected)
         self.canvas.segmentSelectionChanged.connect(self._on_segment_selection_changed)
         self.canvas.edgeHovered.connect(self._on_edge_hovered)
+        self.canvas.locationClicked.connect(self._on_location_clicked)
 
         # Session state.
         self._project: ProjectDB | None = None
@@ -175,6 +180,14 @@ class MainWindow(QMainWindow):
         self._segment_edges: list = []
         self._segment_context: dict = {}
         self._segment_neighbours: dict[int, str] = {}
+
+        # Location-fixing (Milestone 16): the parcel the fixes attach to and the
+        # in-progress click flow. `_loc_awaiting` is None, "reference", or "target";
+        # `_loc_pending` holds a just-placed reference (px, label) while its
+        # distance/bearing or target is captured.
+        self._location_parcel_id: int | None = None
+        self._loc_awaiting: str | None = None
+        self._loc_pending: tuple | None = None
 
         # Image preprocessing (M8): a display-time, non-destructive preview. The
         # raw raster and the source file are never modified; the enhanced raster
@@ -203,6 +216,7 @@ class MainWindow(QMainWindow):
         self._build_review_toolbar()
         self._build_parcel_dock()
         self._build_segment_dock()
+        self._build_location_dock()
 
     # -- construction -------------------------------------------------------
 
@@ -277,6 +291,14 @@ class MainWindow(QMainWindow):
             "being edited.")
         self._select_action.toggled.connect(self._on_select_toggled)
         bar.addAction(self._select_action)
+
+        # Location-fixing (Milestone 16): its own mutually-exclusive canvas mode.
+        self._location_action = QAction("Locate", self, checkable=True)
+        self._location_action.setToolTip(
+            "Location-fix (encroachment): mark durable landmarks and a target point "
+            "for a selected parcel to get distance + bearing. Needs a scale set.")
+        self._location_action.toggled.connect(self._on_location_toggled)
+        bar.addAction(self._location_action)
 
     def _build_units_toolbar(self) -> None:
         """A visible 'Display units' row: pick the local area unit shown alongside
@@ -920,6 +942,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "No document", "Open a PDF or image first.")
                 return
             self._set_segment_checked(False)
+            self._set_location_checked(False)
             self._sync_crosshair_action()
             self._status.setText(
                 "Select mode: click a parcel to toggle it, drag to select several. "
@@ -1132,6 +1155,7 @@ class MainWindow(QMainWindow):
             return
         self._set_select_checked(False)   # canvas already left selection mode
         self._set_segment_checked(False)
+        self._set_location_checked(False)
         self._sync_crosshair_action()
         self._status.setText(
             "Set scale: click two points a known distance apart; drag or arrow-keys "
@@ -1322,6 +1346,288 @@ class MainWindow(QMainWindow):
             note=f"DXF $INSUNITS={cand.insunits} ({cand.unit_name}), "
                  f"{cand.units_per_pixel:.6g} unit/px")
 
+    # -- location-fixing (Milestone 16) -------------------------------------
+
+    _LOC_COLS = ("Landmark", "Distance", "Bearing", "Source")
+
+    def _build_location_dock(self) -> None:
+        """Right-side dock listing a parcel's reference-landmark observations with a
+        live cross-check of the positions they imply (a review aid; the fixes
+        persist on the parcel for a future report)."""
+        dock = QDockWidget("Location fixes", self)
+        dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea |
+                             Qt.DockWidgetArea.RightDockWidgetArea)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        self._location_hint = QLabel(
+            "‘Locate’ mode: click a durable landmark, then give a field "
+            "distance/bearing to the parcel — or point to the target on the sheet. "
+            "Bearings are screen-up = North (the sheet's top), not guaranteed true "
+            "north if the scan is rotated.")
+        self._location_hint.setWordWrap(True)
+        layout.addWidget(self._location_hint)
+
+        self._location_table = QTableWidget(0, len(self._LOC_COLS))
+        self._location_table.setHorizontalHeaderLabels(self._LOC_COLS)
+        self._location_table.verticalHeader().setVisible(False)
+        self._location_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._location_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self._location_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self._location_table, 1)
+
+        self._location_crosscheck = QLabel("Cross-check: —")
+        self._location_crosscheck.setWordWrap(True)
+        layout.addWidget(self._location_crosscheck)
+
+        buttons = QHBoxLayout()
+        self._loc_add_btn = QPushButton("Add landmark…")
+        self._loc_add_btn.clicked.connect(self.add_location_landmark)
+        self._loc_clear_btn = QPushButton("Clear fixes")
+        self._loc_clear_btn.clicked.connect(self.clear_location_fixes)
+        buttons.addWidget(self._loc_add_btn)
+        buttons.addWidget(self._loc_clear_btn)
+        layout.addLayout(buttons)
+
+        dock.setWidget(body)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self._location_dock = dock
+
+    def _set_location_checked(self, on: bool) -> None:
+        self._location_action.blockSignals(True)
+        self._location_action.setChecked(on)
+        self._location_action.blockSignals(False)
+
+    def _location_target_parcel(self) -> int | None:
+        """The parcel a fix attaches to, scoped by the M7 selection: the active
+        parcel if it's in the selection, else the first selected parcel, else the
+        active parcel. None if there are no parcels at all."""
+        selected = self.selected_parcel_ids()
+        if selected:
+            if self._active_parcel_id in selected:
+                return self._active_parcel_id
+            return selected[0]
+        return self._active_parcel_id
+
+    def begin_location_fix(self) -> None:
+        """Menu/programmatic entry: latch the checkable toggle."""
+        if self._location_action.isChecked():
+            self._on_location_toggled(True)
+        else:
+            self._location_action.setChecked(True)
+
+    def _on_location_toggled(self, checked: bool) -> None:
+        if not checked:
+            if self.canvas.is_locating():
+                self.canvas.stop_location_fix()
+            self._loc_awaiting = None
+            self._loc_pending = None
+            self._status.setText("Location-fix mode off.")
+            return
+
+        if self._project is None or self._source_id is None or not self.canvas.has_image():
+            self._set_location_checked(False)
+            QMessageBox.information(self, "No document",
+                                   "Open a project and a source first.")
+            return
+        # Scale-first: the distance/bearing result is meaningless without a scale.
+        if self._project.get_source_scale(self._source_id) is None:
+            self._set_location_checked(False)
+            QMessageBox.information(
+                self, "No scale set",
+                "Set a scale for this source first (Set scale / PDF scale / DXF "
+                "scale) — a location fix reports real distances, which need a scale.")
+            return
+        target_pid = self._location_target_parcel()
+        if target_pid is None:
+            self._set_location_checked(False)
+            QMessageBox.information(
+                self, "No parcel",
+                "Select (or create) a parcel first — a location fix attaches to a "
+                "parcel. Use Select parcels, or New parcel.")
+            return
+
+        self._location_parcel_id = target_pid
+        self._set_select_checked(False)
+        self._set_segment_checked(False)
+        if not self.canvas.start_location_fix():
+            self._set_location_checked(False)
+            return
+        self._sync_crosshair_action()
+        self._loc_awaiting = "reference"
+        self._loc_pending = None
+        self._refresh_location_ui()
+        self._status.setText(
+            "Location-fix: click a durable landmark (tubewell, building, …) on the "
+            "sheet.")
+
+    def add_location_landmark(self) -> None:
+        """Start capturing another landmark (the dock button). Enters Locate mode if
+        not already in it."""
+        if not self.canvas.is_locating():
+            self.begin_location_fix()
+            return
+        self._loc_awaiting = "reference"
+        self._loc_pending = None
+        self._status.setText("Click the landmark on the sheet.")
+
+    def _on_location_clicked(self, scene_pt) -> None:
+        if not self.canvas.is_locating():
+            return
+        px = (scene_pt.x(), scene_pt.y())
+        if self._loc_awaiting == "target" and self._loc_pending is not None:
+            ref_px, label = self._loc_pending
+            target = self._snap_location_target(px)
+            self.add_location_reference_sheet(ref_px, target, label)
+            self._loc_pending = None
+            self._loc_awaiting = "reference"
+        else:
+            self._capture_reference(px)
+
+    def _capture_reference(self, ref_px) -> None:
+        """A landmark was clicked: name it, then either take a field measurement or
+        wait for the user to point at the target on the sheet (the 'both' design)."""
+        n = len(self._project.list_location_fixes(self._location_parcel_id)) \
+            if self._project and self._location_parcel_id else 0
+        label, ok = QInputDialog.getText(self, "Landmark name", "Landmark (e.g. tubewell):",
+                                         text=f"Ref {n + 1}")
+        if not ok:
+            self._status.setText("Landmark cancelled.")
+            return
+        label = label.strip() or f"Ref {n + 1}"
+        has_field = QMessageBox.question(
+            self, "Measurement",
+            "Do you have a field-measured distance from this landmark to the parcel?\n\n"
+            "Yes — enter the distance (and bearing, if known).\n"
+            "No — point to the target boundary point on the sheet.") \
+            == QMessageBox.StandardButton.Yes
+        if has_field:
+            distance, ok = QInputDialog.getDouble(
+                self, "Field distance", "Distance to the parcel (metres):",
+                10.0, 0.0, 1_000_000.0, 2)
+            if not ok:
+                self._status.setText("Landmark cancelled.")
+                return
+            bearing = None
+            if QMessageBox.question(
+                    self, "Bearing",
+                    "Do you know the compass bearing (screen-up = North)?") \
+                    == QMessageBox.StandardButton.Yes:
+                bearing, ok = QInputDialog.getDouble(
+                    self, "Field bearing", "Bearing in degrees (0 = North, clockwise):",
+                    0.0, 0.0, 360.0, 1)
+                if not ok:
+                    bearing = None
+            self.add_location_reference_field(ref_px, label, distance, bearing)
+            self._loc_awaiting = "reference"
+        else:
+            self._loc_pending = (ref_px, label)
+            self._loc_awaiting = "target"
+            self._status.setText(f"Now click the target boundary point for “{label}”.")
+
+    def add_location_reference_field(self, ref_px, label, distance_m,
+                                     bearing_deg) -> int | None:
+        """Persist a FIELD observation (user-supplied distance + optional bearing);
+        the target position is computed by trigonometry when a bearing is given.
+        Testable entry point (bypasses dialogs)."""
+        mpp = self._mpp()
+        if self._project is None or self._location_parcel_id is None or mpp is None:
+            return None
+        target = (target_from_field(ref_px, distance_m, bearing_deg, mpp)
+                  if bearing_deg is not None else None)
+        fid = self._project.add_location_fix(
+            self._location_parcel_id, label, ref_px, distance_m,
+            bearing_deg=bearing_deg, target=target, source=SOURCE_FIELD)
+        self._refresh_location_ui()
+        self._status.setText(format_description(label, distance_m, bearing_deg))
+        return fid
+
+    def add_location_reference_sheet(self, ref_px, target_px, label) -> int | None:
+        """Persist a SHEET observation: distance + bearing computed from the marked
+        reference and target using the source scale. Testable entry point."""
+        mpp = self._mpp()
+        if self._project is None or self._location_parcel_id is None or mpp is None:
+            return None
+        distance_m, bearing = observation_from_points(ref_px, target_px, mpp)
+        fid = self._project.add_location_fix(
+            self._location_parcel_id, label, ref_px, distance_m,
+            bearing_deg=bearing, target=target_px, source=SOURCE_SHEET)
+        self._refresh_location_ui()
+        self._status.setText(format_description(label, distance_m, bearing))
+        return fid
+
+    def _snap_location_target(self, px):
+        """Snap a clicked target to a nearby selected/target parcel vertex, so a
+        location reuses an existing traced corner rather than a near-miss click."""
+        if self._project is None:
+            return px
+        pids = self.selected_parcel_ids() or (
+            [self._location_parcel_id] if self._location_parcel_id else [])
+        best, best_d = None, 12.0    # scene-pixel snap tolerance
+        for pid in pids:
+            for vx, vy in self._project.get_parcel_polygon(pid):
+                d = ((vx - px[0]) ** 2 + (vy - px[1]) ** 2) ** 0.5
+                if d < best_d:
+                    best, best_d = (vx, vy), d
+        return best if best is not None else px
+
+    def clear_location_fixes(self) -> None:
+        if self._project is None or self._location_parcel_id is None:
+            return
+        if not self._project.list_location_fixes(self._location_parcel_id):
+            return
+        if QMessageBox.question(self, "Clear location fixes",
+                                "Remove all location fixes for this parcel?") \
+                == QMessageBox.StandardButton.Yes:
+            self._project.clear_location_fixes(self._location_parcel_id)
+            self._loc_pending = None
+            self._refresh_location_ui()
+            self._status.setText("Location fixes cleared.")
+
+    def _location_fixes(self) -> list:
+        if self._project is None or self._location_parcel_id is None:
+            return []
+        return self._project.list_location_fixes(self._location_parcel_id)
+
+    def _refresh_location_ui(self) -> None:
+        self._refresh_location_table()
+        self._refresh_location_overlay()
+        self._update_location_crosscheck()
+
+    def _refresh_location_table(self) -> None:
+        fixes = self._location_fixes()
+        table = self._location_table
+        table.setRowCount(len(fixes))
+        for row, fx in enumerate(fixes):
+            bearing = ("—" if fx["bearing_deg"] is None
+                       else f"{fx['bearing_deg']:.0f} deg")
+            values = [fx["label"], f"{fx['distance_m']:.1f} m", bearing, fx["source"]]
+            for col, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                table.setItem(row, col, item)
+
+    def _refresh_location_overlay(self) -> None:
+        markers, links = [], []
+        for fx in self._location_fixes():
+            markers.append((fx["ref_x"], fx["ref_y"], fx["label"], "ref"))
+            if fx["target_x"] is not None and fx["target_y"] is not None:
+                markers.append((fx["target_x"], fx["target_y"], "", "target"))
+                links.append((fx["ref_x"], fx["ref_y"], fx["target_x"], fx["target_y"]))
+        self.canvas.set_location_overlay(markers, links)
+
+    def _update_location_crosscheck(self) -> None:
+        points = [(fx["target_x"], fx["target_y"]) for fx in self._location_fixes()
+                  if fx["target_x"] is not None and fx["target_y"] is not None]
+        mpp = self._mpp()
+        if not points or mpp is None:
+            self._location_crosscheck.setText("Cross-check: —")
+            return
+        cc = cross_validate_positions(points, mpp)
+        self._location_crosscheck.setText("Cross-check: " + cc.describe())
+
     # -- polygon tracing ----------------------------------------------------
 
     def begin_polygon_tracing(self) -> None:
@@ -1330,6 +1636,7 @@ class MainWindow(QMainWindow):
             return
         self._set_select_checked(False)   # canvas already left selection mode
         self._set_segment_checked(False)
+        self._set_location_checked(False)
         self._sync_crosshair_action()
         hint = ("Trace boundary: click to add points; drag or arrow-keys to fine-tune; "
                 "Enter (or 'Close') to finish, Esc to cancel.")
@@ -1557,6 +1864,7 @@ class MainWindow(QMainWindow):
                 "This parcel has no boundary edges to describe yet.")
             return
         self._set_select_checked(False)
+        self._set_location_checked(False)
         self._sync_crosshair_action()
         self._refresh_segment_table()
         self._status.setText(

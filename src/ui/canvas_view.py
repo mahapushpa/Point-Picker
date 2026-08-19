@@ -48,6 +48,9 @@ _MARQUEE_COLOR = QColor("#0B7285")  # rubber-band selection rectangle
 _SELECTED_FILL_ALPHA = 70         # translucent fill marking a selected (not active) parcel
 _SEG_COLOR = QColor("#7048E8")    # selected boundary segment (M12): violet, distinct from all above
 _SEG_HOVER_COLOR = QColor("#B197FC")  # edge under the cursor in segment mode (faint violet)
+_LOC_REF_COLOR = QColor("#0CA678")    # location reference landmark (M16): teal, filled
+_LOC_TARGET_COLOR = QColor("#F76707")  # location target point (M16): orange ring
+_LOC_LINK_COLOR = QColor("#495057")   # reference->target connector (M16): grey dashed
 
 
 def qimage_from_raster(raster: RasterImage) -> QImage:
@@ -99,6 +102,9 @@ class CanvasView(QGraphicsView):
     #: Emitted with the edge index under the cursor in segment mode (-1 when none),
     #: for the live "hover an edge to see its length" readout.
     edgeHovered = Signal(int)
+    #: Emitted (scene x, y) when the user clicks in location-fixing mode (M16); the
+    #: window decides whether it is a reference landmark or a target point.
+    locationClicked = Signal(QPointF)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -158,6 +164,15 @@ class CanvasView(QGraphicsView):
         self._seg_hover_edge: int | None = None
         self.EDGE_HIT_RADIUS = 8   # px around an edge that counts as clicking it
 
+        # Location-fixing (Milestone 16) — a canvas mode for marking durable
+        # reference landmarks and target points; a click emits `locationClicked`
+        # and the window drives the reference/target flow. Purely a display +
+        # click surface here; the geometry lives in core.location.
+        self._locating = False
+        self._loc_items: list = []
+        self._loc_markers: list = []   # (x, y, label, kind) to draw
+        self._loc_links: list = []     # (x1, y1, x2, y2) reference->target links
+
         # Visual confidence overlay (Milestone 13) — review-time DISPLAY controls
         # only. None of these touch stored geometry, the active parcel, the
         # selection, or the current mode; they change only what is drawn over the
@@ -209,6 +224,8 @@ class CanvasView(QGraphicsView):
         self._seg_selected.clear()
         self._seg_items.clear()
         self._seg_hover_edge = None
+        self._locating = False
+        self._loc_items.clear()
         # Reset the review-overlay display to defaults for the new source.
         self._overlays_visible = True
         self._overlay_opacity = 1.0
@@ -264,6 +281,7 @@ class CanvasView(QGraphicsView):
         self._reset_polygon_mode()          # modes are mutually exclusive
         self._reset_selection_mode()
         self._reset_segment_mode()
+        self._reset_location_mode()
         self._redraw_segments()
         self.clear_scale_markers()
         self._calibrating = True
@@ -299,6 +317,7 @@ class CanvasView(QGraphicsView):
         self._reset_calibration_mode()       # modes are mutually exclusive
         self._reset_selection_mode()
         self._reset_segment_mode()
+        self._reset_location_mode()
         self._redraw_segments()
         if self._poly_closed:
             self._poly_closed = False        # re-open to continue editing
@@ -497,6 +516,7 @@ class CanvasView(QGraphicsView):
         self._reset_calibration_mode()
         self._reset_polygon_mode()
         self._reset_selection_mode()
+        self._reset_location_mode()
         self._clear_snap_indicator()
         self._segmenting = True
         self.setFocus()
@@ -609,6 +629,90 @@ class CanvasView(QGraphicsView):
         self._scene.addItem(line)
         self._seg_items.append(line)
 
+    # -- location-fixing (Milestone 16) -------------------------------------
+    #
+    # Own canvas mode, mutually exclusive with scale/trace/select/segment (same
+    # pattern). A left click emits `locationClicked` in scene (pixel) coordinates;
+    # the window decides whether it lands as a reference landmark or a target, and
+    # hands back markers to draw via `set_location_overlay`.
+
+    def start_location_fix(self) -> bool:
+        """Enter location-fixing mode. Independent of tracing state — usable before,
+        after, or without a traced boundary. Returns False if there is no image."""
+        if self._pixmap_item is None:
+            return False
+        self._reset_calibration_mode()
+        self._reset_polygon_mode()
+        self._reset_selection_mode()
+        self._reset_segment_mode()
+        self._redraw_segments()
+        self._clear_snap_indicator()
+        self._locating = True
+        self.setFocus()
+        self._update_cursor()
+        self.viewport().update()
+        return True
+
+    def stop_location_fix(self) -> None:
+        self._locating = False
+        self._update_cursor()
+        self.viewport().update()
+
+    def is_locating(self) -> bool:
+        return self._locating
+
+    def _reset_location_mode(self) -> None:
+        """Leave location interaction; keep the drawn markers (another tool may be
+        used, then location resumed)."""
+        self._locating = False
+
+    def set_location_overlay(self, markers, links=()) -> None:
+        """Draw location-fix markers and reference->target links. *markers* is a
+        list of ``(x, y, label, kind)`` (kind 'ref' or 'target'); *links* a list of
+        ``(x1, y1, x2, y2)``. Visual only — the window owns the data."""
+        self._loc_markers = [(float(x), float(y), str(lb), str(k)) for x, y, lb, k in markers]
+        self._loc_links = [(float(a), float(b), float(c), float(d)) for a, b, c, d in links]
+        self._redraw_location()
+
+    def _redraw_location(self) -> None:
+        self._remove_items(self._loc_items)
+        if not self._overlays_visible:
+            return   # honour the M13 global overlay hide
+        for a, b, c, d in self._loc_links:
+            pen = QPen(_LOC_LINK_COLOR)
+            pen.setWidth(1)
+            pen.setCosmetic(True)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            line = QGraphicsLineItem(a, b, c, d)
+            line.setPen(pen)
+            line.setZValue(6)
+            self._scene.addItem(line)
+            self._loc_items.append(line)
+        for x, y, label, kind in self._loc_markers:
+            color = _LOC_REF_COLOR if kind == "ref" else _LOC_TARGET_COLOR
+            r = 6.0
+            pen = QPen(color)
+            pen.setWidth(2)
+            pen.setCosmetic(True)
+            dot = QGraphicsEllipseItem(-r, -r, 2 * r, 2 * r)
+            dot.setPen(pen)
+            if kind == "ref":
+                dot.setBrush(QBrush(color))   # landmark: filled; target: open ring
+            dot.setPos(QPointF(x, y))
+            dot.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+            dot.setZValue(12)
+            self._scene.addItem(dot)
+            self._loc_items.append(dot)
+            if label:
+                text = QGraphicsSimpleTextItem(label)
+                text.setBrush(color)
+                text.setPos(QPointF(x, y))
+                text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+                text.moveBy(r + 3, -(r + 13))
+                text.setZValue(12)
+                self._scene.addItem(text)
+                self._loc_items.append(text)
+
     # -- visual confidence overlay (Milestone 13) ---------------------------
     #
     # Review-only display controls: a way to compare what's traced against the
@@ -678,6 +782,7 @@ class CanvasView(QGraphicsView):
         self._redraw_polygon()
         self._redraw_segments()
         self._redraw_calibration()
+        self._redraw_location()
         self.viewport().update()   # crosshair is painted in drawForeground
 
     def _apply_opacity(self, bucket: list) -> None:
@@ -745,6 +850,7 @@ class CanvasView(QGraphicsView):
         self._reset_calibration_mode()   # drop an in-progress calibration
         self._reset_polygon_mode()       # stop tracing, keep the polygon
         self._reset_segment_mode()
+        self._reset_location_mode()
         self._redraw_segments()
         self._clear_snap_indicator()
         self._selecting = True
@@ -927,7 +1033,9 @@ class CanvasView(QGraphicsView):
                 was_click = not self._moved
                 self._update_cursor()
                 if was_click:
-                    if self._segmenting:
+                    if self._locating:
+                        self.locationClicked.emit(self.mapToScene(event.position().toPoint()))
+                    elif self._segmenting:
                         self._toggle_edge_at(event.position())
                     else:
                         self._place_point(self.mapToScene(event.position().toPoint()))
@@ -1255,7 +1363,7 @@ class CanvasView(QGraphicsView):
             # Hide the OS cursor when the drawn crosshair is showing, else a cross.
             self.setCursor(Qt.CursorShape.BlankCursor if self._crosshair_enabled
                            else Qt.CursorShape.CrossCursor)
-        elif self._selecting or self._segmenting:
+        elif self._selecting or self._segmenting or self._locating:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
         else:
             self.setCursor(Qt.CursorShape.OpenHandCursor)
