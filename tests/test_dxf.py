@@ -105,6 +105,46 @@ class DxfRenderTests(unittest.TestCase):
         self.assertGreater(black, 0)
         self.assertEqual(pixel(w // 2, h // 2), (255, 255, 255))
 
+    def test_y_axis_is_flipped_orientation_not_mirrored(self):
+        # DXF is Y-up; raster images are Y-down. A symmetric shape (or a bbox /
+        # line-count check) would pass even if the render were mirrored — which
+        # would silently flip every compass bearing in an M12 boundary report from
+        # a DXF source. Use a right triangle whose right-angle corner is at world
+        # (0,0): its horizontal leg runs along the BOTTOM (y=0) and its vertical leg
+        # along the LEFT (x=0), so a correct render puts the long horizontal line in
+        # the image's bottom half and the long vertical line in its left half.
+        d = Path(tempfile.mkdtemp()) / "tri.dxf"
+        doc = ezdxf.new()
+        doc.header["$INSUNITS"] = 6
+        msp = doc.modelspace()
+        for a, b in [((0, 0), (10, 0)), ((0, 0), (0, 10)), ((10, 0), (0, 10))]:
+            msp.add_line(a, b)
+        doc.saveas(str(d))
+
+        r = render_dxf(d)
+        w, h, data = r.raster.width, r.raster.height, r.raster.data
+
+        def is_black(x, y):
+            i = (y * w + x) * 4
+            return data[i] == 0 and data[i + 1] == 0 and data[i + 2] == 0
+
+        row_black = [sum(1 for x in range(w) if is_black(x, y)) for y in range(h)]
+        col_black = [sum(1 for y in range(h) if is_black(x, y)) for x in range(w)]
+        # The full-width horizontal leg is the row with the most black pixels; the
+        # full-height vertical leg is the column with the most.
+        h_leg_row = max(range(h), key=lambda y: row_black[y])
+        v_leg_col = max(range(w), key=lambda x: col_black[x])
+
+        # World y=0 (bottom) must land in the image's BOTTOM half (Y flipped), not
+        # the top; world x=0 (left) in the LEFT half (X not flipped).
+        self.assertGreater(h_leg_row, h * 0.5,
+                           "horizontal leg (world y=0) should render at the image bottom")
+        self.assertLess(v_leg_col, w * 0.5,
+                        "vertical leg (world x=0) should render at the image left")
+        # And the far corner opposite the right angle — world (10,10), outside the
+        # triangle — must be the image's TOP-RIGHT, confirming both axes at once.
+        self.assertFalse(is_black(w - 1 - 2, 2))    # top-right stays blank
+
     def test_unsupported_entities_are_flagged_not_dropped_silently(self):
         def extras(msp):
             msp.add_circle((5, 5), 2)
