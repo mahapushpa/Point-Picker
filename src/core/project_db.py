@@ -762,18 +762,25 @@ class ProjectDB:
         self.conn.commit()
 
     def apply_template_to_parcel(self, parcel_id: int, template_id: int) -> list[dict]:
-        """Populate a parcel's fields from *template_id*'s labels (a one-way copy;
-        the template is untouched). Values already present under a matching label
-        are preserved; labels not in the template are dropped. Returns the new
-        fields. Applying is a starting point — the user edits the parcel freely
-        afterwards without affecting the template."""
+        """Add *template_id*'s labels to a parcel's fields (a one-way copy; the
+        template is untouched). **Additive only:** every existing field is kept
+        with its value, and any template label the parcel doesn't already have is
+        appended (empty). Nothing is ever removed — so a parcel can accumulate
+        multiple identifiers across a land-type conversion (e.g. an old Khasra
+        number survives when a residential template with a Plot number is applied
+        later). Removing a field is done explicitly via the identification form.
+        Returns the resulting fields."""
         template = self.get_template(template_id)
         if template is None:
             raise ProjectError(f"No template with id {template_id}.")
         if self.conn.execute("SELECT 1 FROM parcels WHERE id = ?", (parcel_id,)).fetchone() is None:
             raise ProjectError(f"No parcel with id {parcel_id} in this project.")
-        existing = {f["label"]: f["value"] for f in self.get_parcel_fields(parcel_id)}
-        new_fields = [(label, existing.get(label, "")) for label in template["fields"]]
+        existing = self.get_parcel_fields(parcel_id)
+        existing_labels = {f["label"] for f in existing}
+        new_fields = [(f["label"], f["value"]) for f in existing]
+        for label in template["fields"]:
+            if label not in existing_labels:
+                new_fields.append((label, ""))   # append missing template labels, empty
         self.set_parcel_fields(parcel_id, new_fields)
         return self.get_parcel_fields(parcel_id)
 

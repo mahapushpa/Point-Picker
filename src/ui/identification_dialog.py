@@ -138,17 +138,23 @@ class IdentificationDialog(QDialog):
     # -- actions ------------------------------------------------------------
 
     def _on_apply_template(self) -> None:
-        """Populate the fields table from the chosen template, preserving values
-        already entered under matching labels. In-memory only until Save, and the
-        template itself is never modified."""
+        """Add the chosen template's labels to the fields table — **additive**:
+        existing rows (and their values) are kept, and any template label not
+        already present is appended (empty). Nothing is removed, so old
+        identifiers survive when a different template is applied later. In-memory
+        only until Save, and the template itself is never modified."""
         tid = self._template_combo.currentData()
         if tid is None:
             return
         template = self._project.get_template(tid)
         if template is None:
             return
-        existing = {label: value for label, value in self._rows() if label}
-        self._set_rows([(label, existing.get(label, "")) for label in template["fields"]])
+        rows = self._rows()
+        existing_labels = {label for label, _ in rows if label}
+        for label in template["fields"]:
+            if label not in existing_labels:
+                rows.append((label, ""))
+        self._set_rows(rows)
 
     def _on_save(self) -> None:
         owner = self._owner_edit.text().strip() or None

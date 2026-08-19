@@ -109,8 +109,12 @@ browser prototypes whose *logic* seeds this tool are kept under
   agricultural / Rural — residential / Urban) are seeded per project and
   protected read-only at the DB layer; **user templates** are fully editable via
   a **Manage templates…** dialog — same pattern as M9's units. Applying a
-  template to a parcel populates its **Identification…** form (a one-way copy —
-  editing the parcel never changes the template). Always present regardless of
+  template to a parcel is **additive**: it keeps every existing field and appends
+  any template labels the parcel doesn't have yet, so old identifiers survive a
+  land-type conversion (e.g. an old Khasra number is kept when a residential
+  template with a Plot number is applied later). It's a one-way copy — editing
+  the parcel never changes the template, and fields are removed only via the
+  form's remove-row control. Always present regardless of
   template: the **source-document reference**, the **owner** (kept as the
   first-class `parcels.owner` grouping key for owner-wise reports, surfaced in the
   same form), and a free-text **notes** field. Templates travel with the project

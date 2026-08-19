@@ -105,6 +105,21 @@ class IdentificationDialogTests(unittest.TestCase):
         after = self.p.get_template(self.agri["id"])["fields"]
         self.assertEqual(before, after)  # template unchanged by parcel editing
 
+    def test_apply_in_dialog_is_additive_keeps_old_field(self):
+        # Parcel already has an old Khasra; applying the residential template in
+        # the dialog must keep it and add Plot number (additive), not replace.
+        self.p.set_parcel_fields(self.pid, [("Khasra number", "K-42")])
+        dlg = IdentificationDialog(self.p, self.pid)
+        self._select_template(dlg, "Rural — residential")
+        dlg._on_apply_template()
+        rows = dict(dlg._rows())
+        self.assertEqual(rows["Khasra number"], "K-42")  # survived in the table
+        self.assertIn("Plot number", rows)               # added
+        dlg._on_save()
+        saved = {f["label"]: f["value"] for f in self.p.get_parcel_fields(self.pid)}
+        self.assertEqual(saved["Khasra number"], "K-42")
+        self.assertIn("Plot number", saved)
+
     def test_add_and_remove_field_rows(self):
         dlg = IdentificationDialog(self.p, self.pid)
         dlg._set_rows([])

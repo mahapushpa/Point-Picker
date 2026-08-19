@@ -773,17 +773,39 @@ class TemplateAndFieldsTests(unittest.TestCase):
             self.assertEqual(labels, p.get_template(agri["id"])["fields"])
             self.assertTrue(all(f["value"] == "" for f in p.get_parcel_fields(pid)))
 
-    def test_apply_preserves_existing_values_by_label(self):
+    def test_apply_is_additive_preserves_values_and_extra_fields(self):
         with ProjectDB.create(self.tmp / "proj") as p:
             sid = self._source_id(p)
             pid = p.create_parcel(sid)
-            p.set_parcel_fields(pid, [("Village", "Rampur"), ("Extra", "keepme?")])
+            p.set_parcel_fields(pid, [("Village", "Rampur"), ("Extra", "keepme")])
             agri = next(t for t in p.list_templates() if t["name"] == "Rural — agricultural")
             p.apply_template_to_parcel(pid, agri["id"])
             fields = {f["label"]: f["value"] for f in p.get_parcel_fields(pid)}
-            self.assertEqual(fields["Village"], "Rampur")  # carried over
-            self.assertNotIn("Extra", fields)              # not in template -> dropped
+            self.assertEqual(fields["Village"], "Rampur")  # matching label: value carried over
+            self.assertEqual(fields["Extra"], "keepme")    # non-template field: kept, not dropped
             self.assertEqual(fields["Khasra number"], "")  # new template label, empty
+
+    def test_apply_additive_keeps_old_identifier_across_conversion(self):
+        """The brief's rural->residential conversion: an old Khasra number must
+        survive when the residential template (which has Plot number, no Khasra)
+        is applied later — no data lost, Plot number added."""
+        with ProjectDB.create(self.tmp / "proj") as p:
+            sid = self._source_id(p)
+            pid = p.create_parcel(sid)
+            # Parcel started under the agricultural template with a real Khasra.
+            p.set_parcel_fields(pid, [("Khasra number", "K-42"), ("Village", "Rampur")])
+            resid = next(t for t in p.list_templates() if t["name"] == "Rural — residential")
+            p.apply_template_to_parcel(pid, resid["id"])
+            fields = {f["label"]: f["value"] for f in p.get_parcel_fields(pid)}
+            self.assertEqual(fields["Khasra number"], "K-42")  # OLD identifier survived
+            self.assertIn("Plot number", fields)               # NEW identifier added
+            self.assertEqual(fields["Plot number"], "")
+            self.assertEqual(fields["Village"], "Rampur")      # shared label value kept
+            # Every residential label is now present; nothing was removed.
+            for label in p.get_template(resid["id"])["fields"]:
+                self.assertIn(label, fields)
+            labels = [f["label"] for f in p.get_parcel_fields(pid)]
+            self.assertIn("Khasra number", labels)             # still there in the ordered list
 
     def test_editing_parcel_fields_does_not_mutate_template(self):
         with ProjectDB.create(self.tmp / "proj") as p:
