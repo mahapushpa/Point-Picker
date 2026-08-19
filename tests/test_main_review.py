@@ -26,7 +26,7 @@ try:
     from PySide6.QtWidgets import QApplication, QMessageBox
     from src.core.project_db import ProjectDB
     from src.io.raster import open_raster
-    from src.ui.main_window import MainWindow
+    from src.ui.main_window import MainWindow, _HIDDEN_ROLE
     _HAVE_QT = True
 except Exception:  # pragma: no cover
     _HAVE_QT = False
@@ -73,8 +73,9 @@ class OverlayReviewTests(unittest.TestCase):
         self.proj.save_parcel_polygon(self.pid_a, SQUARE_A, closed=True, metres_per_pixel=0.5)
         self.pid_b = self.proj.create_parcel(self.sid, owner="Suresh")
         self.proj.save_parcel_polygon(self.pid_b, SQUARE_B, closed=True, metres_per_pixel=0.5)
-        self.win._parcels = self.proj.list_parcels(self.sid)
-        self.win._set_active_parcel(self.pid_a)
+        # Full reload so the Parcels list widget is populated (the eye toggle and
+        # row cues live on real list items), with A active and B as context.
+        self.win._reload_parcels(select_id=self.pid_a)
 
     def tearDown(self):
         self.win.close()
@@ -181,6 +182,54 @@ class OverlayReviewTests(unittest.TestCase):
         # Still the active parcel, with its points intact — only the drawing hid.
         self.assertEqual(self.win._active_parcel_id, self.pid_a)
         self.assertEqual(self.win.canvas.polygon_points(), pts_before)
+
+    # -- per-row eye toggle (discoverability affordance) --------------------
+
+    def _row_hidden_state(self, pid):
+        """(canvas-hidden, row shows the '(overlay hidden)' cue, delegate role) for
+        a parcel — the three things that must always agree."""
+        row = self.win._parcel_index(pid)
+        item = self.win._parcel_list.item(row)
+        return (self.win.canvas.is_parcel_hidden(pid),
+                "(overlay hidden)" in item.text(),
+                bool(item.data(_HIDDEN_ROLE)))
+
+    def test_eye_click_toggles_visibility_like_the_context_menu(self):
+        row_b = self.win._parcel_index(self.pid_b)
+        self.assertEqual(self._row_hidden_state(self.pid_b), (False, False, False))
+
+        # Eye click hides — same effect as toggle_parcel_overlay (the menu path).
+        self.win._on_parcel_eye_clicked(row_b)
+        self.assertEqual(self._row_hidden_state(self.pid_b), (True, True, True))
+        self.assertEqual(self._background_item_count(), 0)   # B's overlay gone
+
+        # Eye click again shows.
+        self.win._on_parcel_eye_clicked(row_b)
+        self.assertEqual(self._row_hidden_state(self.pid_b), (False, False, False))
+        self.assertGreater(self._background_item_count(), 0)
+
+    def test_eye_and_context_menu_paths_stay_in_sync(self):
+        row_b = self.win._parcel_index(self.pid_b)
+        # Hide via the right-click/menu path...
+        self.win.toggle_parcel_overlay(self.pid_b)
+        self.assertEqual(self._row_hidden_state(self.pid_b), (True, True, True))
+        # ...and show via the eye path: the menu path's displayed state updates too.
+        self.win._on_parcel_eye_clicked(row_b)
+        self.assertEqual(self._row_hidden_state(self.pid_b), (False, False, False))
+
+        # And the reverse ordering: eye hides, menu shows.
+        self.win._on_parcel_eye_clicked(row_b)
+        self.assertEqual(self._row_hidden_state(self.pid_b), (True, True, True))
+        self.win.toggle_parcel_overlay(self.pid_b)
+        self.assertEqual(self._row_hidden_state(self.pid_b), (False, False, False))
+
+    def test_eye_state_survives_an_owner_edit_row_refresh(self):
+        # Hiding, then a row refresh (e.g. owner/point-count change) must keep the
+        # cue and eye state — the shared row-updater guarantees this.
+        row_b = self.win._parcel_index(self.pid_b)
+        self.win._on_parcel_eye_clicked(row_b)
+        self.win._update_parcel_list_row(row_b)
+        self.assertEqual(self._row_hidden_state(self.pid_b), (True, True, True))
 
     # -- opacity ------------------------------------------------------------
 

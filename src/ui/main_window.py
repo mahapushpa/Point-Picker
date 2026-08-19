@@ -23,14 +23,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QColor, QKeySequence
+from PySide6.QtCore import Qt, QEvent, QPointF, QRect, Signal
+from PySide6.QtGui import QAction, QColor, QKeySequence, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QDockWidget, QFileDialog, QHBoxLayout, QHeaderView,
     QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-    QMenu, QMessageBox, QPushButton, QSlider, QTableWidget, QTableWidgetItem,
-    QToolBar, QVBoxLayout, QWidget,
+    QMenu, QMessageBox, QPushButton, QSlider, QStyledItemDelegate,
+    QStyleOptionViewItem, QTableWidget, QTableWidgetItem, QToolBar, QVBoxLayout,
+    QWidget,
 )
 
 from ..core.geometry import measure_polygon
@@ -66,6 +67,70 @@ _FILE_FILTER = (
     "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;"
     "All files (*)"
 )
+
+#: Per-item data role holding a parcel row's overlay-hidden flag, so the row
+#: delegate can paint the eye in the right state (Milestone 13).
+_HIDDEN_ROLE = Qt.ItemDataRole.UserRole + 1
+
+
+class _ParcelRowDelegate(QStyledItemDelegate):
+    """Parcel-list row painter that adds a small, always-visible **eye toggle** at
+    the right of each row and turns a click on it into an overlay-visibility
+    toggle. This is the M13 discoverability fix (same lesson as M7's Select mode:
+    a correct feature is useless if unfindable) — a one-click affordance that sits
+    *alongside* the M7 selection checkbox and the right-click menu, replacing
+    neither. Everything else about the row (checkbox, label, colour, selection) is
+    the base delegate's and is left untouched. The eye is drawn from primitives so
+    it renders identically without depending on an emoji font."""
+
+    #: Emitted with the row index whose eye was clicked.
+    eyeClicked = Signal(int)
+
+    def _eye_size(self, rect: QRect) -> int:
+        return min(rect.height() - 4, 20)
+
+    def _eye_rect(self, rect: QRect) -> QRect:
+        size = self._eye_size(rect)
+        top = rect.top() + (rect.height() - size) // 2
+        return QRect(rect.right() - size - 4, top, size, size)
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        # Reserve room on the right so a long label never runs under the eye.
+        opt = QStyleOptionViewItem(option)
+        opt.rect = QRect(option.rect)
+        opt.rect.setRight(option.rect.right() - self._eye_size(option.rect) - 10)
+        super().paint(painter, opt, index)
+
+        hidden = bool(index.data(_HIDDEN_ROLE))
+        eye = self._eye_rect(option.rect)
+        cx, cy = eye.center().x() + 1, eye.center().y() + 1
+        rx, ry = eye.width() * 0.44, eye.height() * 0.30
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(QColor(120, 120, 120) if hidden else QColor(40, 40, 40))
+        pen.setWidthF(1.4)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QPointF(cx, cy), rx, ry)      # eye outline (almond)
+        if hidden:
+            # A slash across the eye = 'overlay hidden'.
+            painter.drawLine(int(cx - rx), int(cy + ry), int(cx + rx), int(cy - ry))
+        else:
+            painter.setBrush(QColor(40, 40, 40))
+            painter.drawEllipse(QPointF(cx, cy), ry * 0.62, ry * 0.62)  # pupil
+        painter.restore()
+
+    def editorEvent(self, event, model, option, index) -> bool:
+        et = event.type()
+        if et in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease,
+                  QEvent.Type.MouseButtonDblClick):
+            if self._eye_rect(option.rect).contains(event.position().toPoint()):
+                # Consume every eye-area mouse event so the click toggles overlay
+                # visibility *without* also changing the active/selected parcel.
+                if et == QEvent.Type.MouseButtonRelease:
+                    self.eyeClicked.emit(index.row())
+                return True
+        return super().editorEvent(event, model, option, index)
 
 
 class MainWindow(QMainWindow):
@@ -287,6 +352,14 @@ class MainWindow(QMainWindow):
         self.canvas.set_parcel_hidden(parcel_id, now_hidden)
         self._refresh_parcel_visibility_cues()
 
+    def _on_parcel_eye_clicked(self, row: int) -> None:
+        """A click on a row's eye indicator toggles that parcel's overlay — the
+        exact same action as the right-click 'Hide/Show overlay', just a visible
+        one-click path. Both refresh through the same code, so the eye glyph, the
+        '(overlay hidden)' cue, and the canvas stay in lock-step."""
+        if 0 <= row < len(self._parcels):
+            self.toggle_parcel_overlay(self._parcels[row]["id"])
+
     def _on_parcel_context_menu(self, pos) -> None:
         item = self._parcel_list.itemAt(pos)
         if item is None:
@@ -299,21 +372,34 @@ class MainWindow(QMainWindow):
         if chosen is toggle:
             self.toggle_parcel_overlay(pid)
 
+    def _apply_row_visibility_cue(self, row: int) -> None:
+        """Reflect one parcel's overlay-hidden state on its row: a dimmed,
+        '(overlay hidden)'-suffixed label plus the ``_HIDDEN_ROLE`` flag the eye
+        delegate paints from. Shared by every row-refresh path so the eye icon and
+        the text cue can never disagree. Caller blocks list signals."""
+        if not (0 <= row < len(self._parcels)):
+            return
+        item = self._parcel_list.item(row)
+        if item is None:
+            return
+        pid = item.data(Qt.ItemDataRole.UserRole)
+        hidden = self.canvas.is_parcel_hidden(pid)
+        item.setText(self._parcel_label(row, self._parcels[row])
+                     + ("  (overlay hidden)" if hidden else ""))
+        color = QColor(_parcel_color(row))
+        if hidden:
+            color.setAlpha(90)
+        item.setForeground(color)
+        item.setData(_HIDDEN_ROLE, hidden)
+
     def _refresh_parcel_visibility_cues(self) -> None:
-        """Reflect each parcel's overlay-hidden state in its list row (a dimmed,
-        '(overlay hidden)'-suffixed label), without disturbing the active row."""
+        """Re-apply the overlay-hidden cue (label + eye) to every row, without
+        disturbing the active row."""
         self._parcel_list.blockSignals(True)
         for row in range(self._parcel_list.count()):
-            item = self._parcel_list.item(row)
-            pid = item.data(Qt.ItemDataRole.UserRole)
-            hidden = self.canvas.is_parcel_hidden(pid)
-            item.setText(self._parcel_label(row, self._parcels[row])
-                         + ("  (overlay hidden)" if hidden else ""))
-            color = QColor(_parcel_color(row))
-            if hidden:
-                color.setAlpha(90)
-            item.setForeground(color)
+            self._apply_row_visibility_cue(row)
         self._parcel_list.blockSignals(False)
+        self._parcel_list.viewport().update()   # repaint the eye indicators
 
     def _build_parcel_dock(self) -> None:
         """Sidebar listing the current source's parcels: select the active one,
@@ -330,12 +416,17 @@ class MainWindow(QMainWindow):
         # the selection working set. Two independent states in one list.
         self._parcel_list.currentRowChanged.connect(self._on_parcel_row_changed)
         self._parcel_list.itemChanged.connect(self._on_parcel_item_changed)
-        # Right-click a parcel to hide/show just its overlay (Milestone 13 review).
+        # Per-row eye toggle (Milestone 13): a visible one-click affordance for
+        # overlay visibility, drawn by the delegate and clicked directly.
+        self._parcel_delegate = _ParcelRowDelegate(self._parcel_list)
+        self._parcel_delegate.eyeClicked.connect(self._on_parcel_eye_clicked)
+        self._parcel_list.setItemDelegate(self._parcel_delegate)
+        # Right-click a parcel to hide/show its overlay too (secondary path).
         self._parcel_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._parcel_list.customContextMenuRequested.connect(self._on_parcel_context_menu)
         self._parcel_list.setToolTip(
             "Click a parcel to edit it; tick its box to add it to the selection; "
-            "right-click to hide/show just its overlay (review).")
+            "click the eye (or right-click) to hide/show just its overlay (review).")
         layout.addWidget(self._parcel_list, 1)
 
         buttons = QHBoxLayout()
@@ -902,9 +993,11 @@ class MainWindow(QMainWindow):
         return None
 
     def _update_parcel_list_row(self, index: int) -> None:
-        item = self._parcel_list.item(index)
-        if item is not None:
-            item.setText(self._parcel_label(index, self._parcels[index]))
+        # Route through the shared cue helper so an owner/point-count refresh keeps
+        # the '(overlay hidden)' suffix and eye state intact.
+        self._parcel_list.blockSignals(True)
+        self._apply_row_visibility_cue(index)
+        self._parcel_list.blockSignals(False)
 
     def _mpp(self) -> float | None:
         return self._scale.metres_per_pixel if self._scale is not None else None
