@@ -1825,9 +1825,17 @@ class MainWindow(QMainWindow):
         Never auto-accepts — the user presses Enter/Esc (or uses the Boundary menu)."""
         if self._raw_raster is None:
             return
-        from ..io.tracing_assist import follow_line
+        from ..io.tracing_assist import follow_line, AssistUnavailable
         try:
             path = follow_line(self._raw_raster, (start.x(), start.y()), (end.x(), end.y()))
+        except AssistUnavailable as exc:
+            # Points too far apart for a bounded search — fall back to manual.
+            QMessageBox.information(
+                self, "Assist unavailable",
+                f"{exc}.\n\nMark two points closer together along the line, or trace "
+                "this segment manually.")
+            self.canvas.clear_assist_preview()
+            return
         except Exception as exc:   # degenerate raster etc. — never crash the UI
             QMessageBox.warning(self, "Could not follow line", str(exc))
             self.canvas.clear_assist_preview()

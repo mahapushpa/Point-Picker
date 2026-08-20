@@ -15,6 +15,15 @@ never crashes), which the user can simply reject and trace by hand instead.
 Only meaningful for scanned/rendered pixel sources; a DXF's boundary is exact
 vector geometry rendered to a clean raster we generate, with no ink to follow, so
 callers disable the assist for DXF (same reasoning as M17's missing-corner check).
+
+Why this lives in ``io/`` and not ``core/``: like :mod:`src.io.guardrails` and
+:mod:`src.io.preprocess`, it is a heuristic that reads a source's *decoded raster
+pixels* (a :class:`~src.io.raster.RasterImage`). ``io/`` owns everything tied to a
+source's pixel/byte representation — the file-format loaders (``pdf_loader`` /
+``dxf_loader``) *decode* files into that representation, and these modules
+*analyse* it. ``core/`` is deliberately source-representation-independent domain
+logic (geometry, scale, units, polygon/topology) with no pixel dependency, so a
+pixel-sampling search belongs here, not there.
 """
 
 from __future__ import annotations
@@ -44,6 +53,20 @@ MARGIN_PX = 48
 #: set of vertices — corner-preserving, so real bends survive (and remain visible
 #: to M17's missing-corner check) instead of becoming thousands of points.
 SIMPLIFY_PX = 2.0
+
+#: Node budget for the Dijkstra search: the ROI (the two marks' bounding box grown
+#: by MARGIN_PX) may not exceed this many pixels. A pure-Python heap search over
+#: more than ~1M nodes would hang noticeably, and two marks that far apart aren't a
+#: line-follow anyway. This guard matters specifically for large scanned village
+#: sheets, where a stray distant pair of clicks could otherwise freeze the app for
+#: seconds — instead the caller is told to trace that segment manually.
+MAX_ROI_PIXELS = 1_200_000
+
+
+class AssistUnavailable(Exception):
+    """Raised when the two marks are too far apart to follow within the search
+    budget (:data:`MAX_ROI_PIXELS`). The caller should fall back to manual tracing
+    rather than hang on an unbounded search."""
 
 _SQRT2 = sqrt(2.0)
 _NEIGHBOURS = ((-1, -1, _SQRT2), (-1, 0, 1.0), (-1, 1, _SQRT2),
@@ -156,7 +179,9 @@ def follow_line(raster: RasterImage, start: Point, end: Point, *,
     Least-cost search over a darkness/gradient cost image, restricted to the two
     points' bounding box plus *margin_px*. Never raises on a faint/ambiguous line —
     it returns the least-cost path found (which the caller shows for confirm /
-    reject). Raises ``ValueError`` only for a degenerate raster.
+    reject). Raises :class:`AssistUnavailable` if the two marks are so far apart
+    that the search area exceeds :data:`MAX_ROI_PIXELS` (fall back to manual
+    tracing), and ``ValueError`` for a degenerate raster.
     """
     gray = _grayscale(raster)
     h, w = gray.shape
@@ -171,6 +196,12 @@ def follow_line(raster: RasterImage, start: Point, end: Point, *,
     x1 = min(w, max(sx, ex) + margin_px + 1)
     y0 = max(0, min(sy, ey) - margin_px)
     y1 = min(h, max(sy, ey) + margin_px + 1)
+    roi_area = (x1 - x0) * (y1 - y0)
+    if roi_area > MAX_ROI_PIXELS:
+        raise AssistUnavailable(
+            f"the two points are too far apart to follow automatically "
+            f"({roi_area:,}-pixel search area exceeds the {MAX_ROI_PIXELS:,} "
+            "budget); trace this segment manually instead")
     cost = _cost_image(gray[y0:y1, x0:x1])
 
     path_local = _dijkstra(cost, (sx - x0, sy - y0), (ex - x0, ey - y0))

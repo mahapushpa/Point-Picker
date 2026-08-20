@@ -21,6 +21,16 @@ is the right level of automation, not a silent fix).
    answer"). This is a raster check, so it is meaningful only for scanned/rendered
    *pixel* sources; a DXF renders exact vector lines to a clean raster we generate
    ourselves, with no scan ambiguity to sample, so callers skip #2 for DXF.
+
+Why this lives in ``io/`` and not ``core/``: check 2 is a heuristic over a
+source's *decoded raster pixels* (a :class:`~src.io.raster.RasterImage`), the same
+category as :mod:`src.io.tracing_assist` and :mod:`src.io.preprocess`. ``io/``
+owns everything tied to a source's pixel/byte representation — the file-format
+loaders (``pdf_loader`` / ``dxf_loader``) *decode* files into it, and these modules
+*analyse* it — whereas ``core/`` is deliberately source-representation-independent
+domain logic (geometry, scale, units, polygon/topology) with no pixel dependency.
+(Check 1 is pure geometry and would fit either layer; it lives here to keep the
+two guard rails together.)
 """
 
 from __future__ import annotations

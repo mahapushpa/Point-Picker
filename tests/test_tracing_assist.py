@@ -15,7 +15,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import numpy as np
 
 from src.io.raster import RasterImage
-from src.io.tracing_assist import follow_line
+from src.io.tracing_assist import follow_line, AssistUnavailable, MAX_ROI_PIXELS
 
 
 def _raster(gray: np.ndarray) -> RasterImage:
@@ -77,6 +77,22 @@ class FollowLineTests(unittest.TestCase):
 
     def test_coincident_points_return_single(self):
         self.assertEqual(follow_line(_L_line(), (50, 50), (50, 50)), [(50.0, 50.0)])
+
+    def test_far_apart_points_are_refused_not_hung(self):
+        # A large sheet with the two marks at opposite corners: the search ROI would
+        # exceed the node budget, so it refuses (fall back to manual) rather than
+        # running an unbounded pure-Python Dijkstra.
+        side = int(MAX_ROI_PIXELS ** 0.5) + 400
+        big = _raster(np.full((side, side), 255, dtype=np.uint8))
+        with self.assertRaises(AssistUnavailable):
+            follow_line(big, (5, 5), (side - 5, side - 5))
+
+    def test_within_budget_still_runs(self):
+        # A pair whose ROI is comfortably under budget still works.
+        g = np.full((400, 400), 255, dtype=np.uint8)
+        g[199:202, 20:380] = 0
+        path = follow_line(_raster(g), (22, 200), (378, 200))
+        self.assertGreaterEqual(len(path), 2)
 
     def test_does_not_mutate_inputs(self):
         r = _L_line()
