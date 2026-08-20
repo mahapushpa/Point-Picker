@@ -345,31 +345,46 @@ class ProjectDB:
         if not db_path.exists():
             raise ProjectError(f"No {DB_FILENAME} found in {root}.")
 
-        conn = _connect(db_path)
-        found = conn.execute("PRAGMA user_version").fetchone()[0]
-        if found > SCHEMA_VERSION:
-            conn.close()
+        # A file named project.db that isn't actually a valid SQLite database
+        # (truncated, garbage bytes, a renamed non-DB file) makes sqlite3 raise
+        # DatabaseError on the first real access — connect() itself is lazy. Wrap
+        # the connect + initial read + any migration so the failure surfaces as a
+        # ProjectError the UI already handles gracefully, not an unguarded crash.
+        try:
+            conn = _connect(db_path)
+            found = conn.execute("PRAGMA user_version").fetchone()[0]
+            if found > SCHEMA_VERSION:
+                conn.close()
+                raise ProjectError(
+                    f"Project schema version {found} is newer than this app supports "
+                    f"(version {SCHEMA_VERSION}); update the application to open it."
+                )
+            if found < SCHEMA_VERSION:
+                conn.executescript(SCHEMA_SQL)   # new tables (source_scales, vertices, parcel_vertices)
+                _ensure_additive_columns(conn)   # new columns (parcels.closed / owner, sources.unit_profile_id)
+                _seed_builtin_units(conn)        # ensure built-in units exist post-upgrade
+                _seed_builtin_templates(conn)    # ensure built-in templates exist post-upgrade
+                if _table_exists(conn, "points"):
+                    # v5 restructuring: rebuild per-parcel points as shared vertices,
+                    # then drop the old table. Safe as a clean rebuild since only
+                    # test parcels exist at this milestone.
+                    _migrate_points_to_vertices(conn)
+                    conn.execute("DROP TABLE points")
+                conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
+                    (str(SCHEMA_VERSION),),
+                )
+                conn.commit()
+        except sqlite3.DatabaseError as exc:
+            try:
+                conn.close()  # type: ignore[possibly-undefined]
+            except (NameError, sqlite3.Error):
+                pass
             raise ProjectError(
-                f"Project schema version {found} is newer than this app supports "
-                f"(version {SCHEMA_VERSION}); update the application to open it."
-            )
-        if found < SCHEMA_VERSION:
-            conn.executescript(SCHEMA_SQL)   # new tables (source_scales, vertices, parcel_vertices)
-            _ensure_additive_columns(conn)   # new columns (parcels.closed / owner, sources.unit_profile_id)
-            _seed_builtin_units(conn)        # ensure built-in units exist post-upgrade
-            _seed_builtin_templates(conn)    # ensure built-in templates exist post-upgrade
-            if _table_exists(conn, "points"):
-                # v5 restructuring: rebuild per-parcel points as shared vertices,
-                # then drop the old table. Safe as a clean rebuild since only
-                # test parcels exist at this milestone.
-                _migrate_points_to_vertices(conn)
-                conn.execute("DROP TABLE points")
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            conn.execute(
-                "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
-                (str(SCHEMA_VERSION),),
-            )
-            conn.commit()
+                f"{db_path} is not a readable project database "
+                f"(it may be corrupt or not a project file): {exc}"
+            ) from exc
         # Ensure the runtime folders exist even if the folder was hand-copied.
         (root / SOURCES_DIRNAME).mkdir(exist_ok=True)
         (root / EXPORTS_DIRNAME).mkdir(exist_ok=True)

@@ -56,6 +56,28 @@ class ProjectDBTests(unittest.TestCase):
         with self.assertRaises(ProjectError):
             ProjectDB.open(self.tmp / "nope")
 
+    def test_open_corrupt_db_raises_projecterror_not_sqlite_error(self):
+        # A project.db that is not a valid SQLite file (garbage bytes, a renamed
+        # non-DB file, a truncated copy) must fail as a ProjectError the UI
+        # handles, never as a raw sqlite3.DatabaseError that crashes the open flow.
+        root = self.tmp / "proj"
+        root.mkdir(parents=True)
+        (root / "project.db").write_bytes(b"this is definitely not a sqlite database" * 4)
+        with self.assertRaises(ProjectError):
+            ProjectDB.open(root)
+
+    def test_open_zero_byte_db_initialises_fresh_schema(self):
+        # A zero-byte project.db is a valid *empty* SQLite database (user_version
+        # 0), which the upgrade path initialises to the current schema — the same
+        # tolerance that lets a hand-copied folder open. This documents that
+        # benign behaviour (contrast with garbage bytes, which must raise): no
+        # crash, no raw sqlite error.
+        root = self.tmp / "proj"
+        root.mkdir(parents=True)
+        (root / "project.db").write_bytes(b"")
+        with ProjectDB.open(root) as p:
+            self.assertEqual(p.schema_version, SCHEMA_VERSION)
+
     def test_open_wrong_schema_version_raises(self):
         root = self.tmp / "proj"
         ProjectDB.create(root).close()
@@ -692,6 +714,7 @@ class UnitProfileTests(unittest.TestCase):
             pid = p2.create_unit_profile("Bigha", 2500.0)
             p2.set_source_unit_profile(sid, pid)               # column exists again
             self.assertEqual(p2.get_source_unit_profile(sid)["id"], pid)
+
 
 
 class TemplateAndFieldsTests(unittest.TestCase):
