@@ -128,11 +128,14 @@ will be filled in one milestone at a time.
 Invoke as a module from the repository root (`python src/main.py …` also works):
 
 ```bash
-python -m src.main gui [optional-file.pdf|png|jpg]   # Milestone 2 viewer
-python -m src.main create ./my-parcel-project --name "Village X survey"
-python -m src.main info   ./my-parcel-project
+python -m src.main                                   # launch the GUI (primary interface)
+python -m src.main gui [optional-file.pdf|png|jpg|dxf]# same, optionally opening a file
+python -m src.main info   ./my-parcel-project        # diagnostics: schema + contents
 python -m src.main selfcheck                          # portability self-check
 ```
+
+New projects are created from the GUI (**File > New Project**); the old
+`create` subcommand was removed once the GUI covered it.
 
 > **Import note:** the source tree is the package `src`, so its sub-package is
 > imported as `src.io` — a bare top-level `io` on the path is shadowed by
@@ -151,7 +154,7 @@ UI a UI-only rewrite. The rule is enforced by a test
 
 ```
 src/
-  main.py            CLI: create / info / selfcheck / gui
+  main.py            CLI: gui (default) / info / selfcheck
   core/              pure Python domain logic
     project_db.py    SQLite schema + read/write for one project folder  (DONE)
     scale.py         two-point scale math (metres per pixel)            (DONE)

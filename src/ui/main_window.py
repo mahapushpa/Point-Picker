@@ -21,10 +21,11 @@ now and calibrate later.
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QEvent, QPointF, QRect, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QKeySequence, QPainter, QPen
+from PySide6.QtCore import Qt, QEvent, QPointF, QRect, Signal
+from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QDockWidget, QFileDialog, QHBoxLayout, QHeaderView,
@@ -56,6 +57,29 @@ from .unit_profiles_dialog import UnitProfilesDialog
 from .templates_dialog import TemplatesDialog
 from .identification_dialog import IdentificationDialog
 from .report_dialog import OwnerReportDialog as ReportDialog
+
+#: Application icon, resolved relative to this source file (not an absolute
+#: path) to preserve the project's portability discipline — the app must run
+#: unchanged from any location / pen drive.
+_ICON_PATH = Path(__file__).resolve().parent / "assets" / "maps_logo.png"
+
+
+def app_icon() -> QIcon | None:
+    """Load the window/taskbar icon from ``assets/maps_logo.png``.
+
+    Returns ``None`` (and warns) if the file is missing or unreadable, so a
+    partial checkout still launches rather than crashing on a missing asset."""
+    if not _ICON_PATH.is_file():
+        warnings.warn(f"application icon not found at {_ICON_PATH}; "
+                      "running without a custom icon")
+        return None
+    icon = QIcon(str(_ICON_PATH))
+    if icon.isNull():
+        warnings.warn(f"application icon at {_ICON_PATH} could not be loaded; "
+                      "running without a custom icon")
+        return None
+    return icon
+
 
 #: Stable, visually-distinct colours assigned to parcels by their position, so
 #: several boundaries on one sheet don't get confused. Avoids the green used by
@@ -146,8 +170,12 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Land Measure Tool")
-        self._did_fit_to_screen = False
-        self._apply_initial_size()
+        icon = app_icon()
+        if icon is not None:
+            self.setWindowIcon(icon)
+        # A modest normal-state size. run() opens the window maximized; this is
+        # only the geometry it restores *down* to, so it stays on any screen.
+        self.resize(1000, 640)
 
         self.canvas = CanvasView(self)
         self.setCentralWidget(self.canvas)
@@ -221,75 +249,6 @@ class MainWindow(QMainWindow):
         self._build_parcel_dock()
         self._build_segment_dock()
         self._build_location_dock()
-
-    # -- window sizing ------------------------------------------------------
-
-    def _apply_initial_size(self) -> None:
-        """Open at a comfortable size, but never larger than the screen.
-
-        A hardcoded ``resize(1100, 760)`` is taller than some laptop panels: a
-        1280x720 screen leaves only ~689px usable once the taskbar is gone, so a
-        739px-tall window frame doesn't fit. Windows then places the oversized
-        window with its title bar clipped above the top edge, so it *looks*
-        frameless and can't be dragged — even though the window flags are
-        entirely normal. Clamp the opening size to the available geometry;
-        :meth:`_ensure_on_screen` (called post-show) guarantees the title bar
-        stays reachable on any screen.
-        """
-        screen = self.screen() or QApplication.primaryScreen()
-        if screen is None:  # pragma: no cover - headless without any screen
-            self.resize(1100, 760)
-            return
-        avail = screen.availableGeometry()
-        # Leave room for the window frame (title bar + borders) inside the
-        # usable area so the whole frame fits, not just the client rectangle.
-        self.resize(min(1100, max(640, avail.width() - 40)),
-                    min(760, max(480, avail.height() - 80)))
-
-    def showEvent(self, event) -> None:
-        """Once, on first show, correct the placement. This runs on the next
-        event-loop tick (via a 0ms timer) so ``frameGeometry`` reflects the real
-        window-manager frame — synchronous correction right after ``show()`` sees
-        a not-yet-realised frame and mis-measures."""
-        super().showEvent(event)
-        if not self._did_fit_to_screen:
-            self._did_fit_to_screen = True
-            QTimer.singleShot(0, self._ensure_on_screen)
-
-    def _ensure_on_screen(self) -> None:
-        """Fit the whole window frame (title bar included) inside the screen's
-        available area, so the title bar is always grabbable even if the window
-        manager first placed an oversized window partly off-screen.
-
-        Done as a single ``setGeometry`` on the *client* rectangle, derived from
-        the realised frame-decoration margins. A two-step resize-then-move is
-        unreliable here: ``frameGeometry`` doesn't refresh synchronously between
-        the calls, so the second step reads stale numbers."""
-        screen = self.screen() or QApplication.primaryScreen()
-        if screen is None:  # pragma: no cover - headless without any screen
-            return
-        avail = screen.availableGeometry()
-        frame = self.frameGeometry()      # includes title bar + borders
-        client = self.geometry()          # the drawable client rectangle
-        # Frame-decoration thickness on each side (0 until the frame is realised,
-        # which is why this runs deferred from showEvent).
-        m_left = client.left() - frame.left()
-        m_top = client.top() - frame.top()
-        m_right = frame.right() - client.right()
-        m_bottom = frame.bottom() - client.bottom()
-        # Largest client size whose frame still fits the usable area.
-        max_cw = max(320, avail.width() - m_left - m_right)
-        max_ch = max(240, avail.height() - m_top - m_bottom)
-        cw = min(client.width(), max_cw)
-        ch = min(client.height(), max_ch)
-        # Position the client so the whole frame sits inside the usable area.
-        cx = min(max(client.left(), avail.left() + m_left),
-                 avail.right() - m_right - cw + 1)
-        cy = min(max(client.top(), avail.top() + m_top),
-                 avail.bottom() - m_bottom - ch + 1)
-        target = QRect(cx, cy, cw, ch)
-        if target != client:
-            self.setGeometry(target)
 
     # -- construction -------------------------------------------------------
 
@@ -2515,8 +2474,15 @@ def _scale_from_db_row(row: dict) -> TwoPointScale:
 def run(file: str | None = None, argv=None) -> int:
     """Launch the GUI. Optionally open *file* on startup. Returns the Qt exit code."""
     app = QApplication.instance() or QApplication(argv or [])
+    icon = app_icon()
+    if icon is not None:
+        app.setWindowIcon(icon)   # taskbar / alt-tab icon
     win = MainWindow()
     if file:
         win.load_path(file)
-    win.show()   # showEvent fits the window onto the screen (title bar reachable)
+    # Open maximized, the way professional desktop tools do. showMaximized()
+    # respects the OS work area (it won't cover the taskbar), and the window
+    # stays freely resizable/restorable — maximized is the opening state, not a
+    # lock (it restores down to the resize(1000, 640) set in __init__).
+    win.showMaximized()
     return app.exec()

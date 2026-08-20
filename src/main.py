@@ -5,28 +5,27 @@ Preferred invocation is ``python -m src.main`` from the repository root;
 package resolves either way — necessary because ``src.io`` must be imported
 qualified, as a bare top-level ``io`` is shadowed by the stdlib).
 
-The command line is deliberately thin: it manages the on-disk project (a
-portable SQLite folder) and launches the GUI. **The GUI is the primary
-interface** — the actual measurement work lives there, and it has grown well
-beyond a viewer into a full application: a menu bar and toolbars; dockable
-Parcels / Boundary-segment / Location panels; several interaction modes
-(Scale, Trace, Select, Segment, Locate, Assist); and dialogs for owner /
-boundary reports, area-unit profiles, and identification templates. None of
-that is discoverable from a CLI usage string — run ``gui`` and explore the
-menus and toolbars.
+**The GUI is the primary interface** — running with no subcommand launches it
+directly. The actual measurement work lives there, and it has grown well beyond
+a viewer into a full application: a menu bar and toolbars; dockable Parcels /
+Boundary-segment / Location panels; several interaction modes (Scale, Trace,
+Select, Segment, Locate, Assist); and dialogs for owner / boundary reports,
+area-unit profiles, and identification templates — including File > New Project
+to create a portable project folder. None of that is discoverable from a CLI
+usage string, so the CLI keeps only two diagnostic commands.
 
 Commands:
-    create     make a new portable project folder (SQLite schema + sources/,
-               exports/ subfolders)
+    (none)     launch the desktop application — the default action
+    gui        the same, but can also open a file on startup
     info       print a project's schema version, unit profiles, and sources
-    selfcheck  portability self-test (build, copy elsewhere, reopen intact)
-    gui        launch the desktop application (optionally opening a file)
+    selfcheck  portability self-test (build, copy elsewhere, reopen intact) —
+               the pen-drive check from Milestone 1
 
 Usage:
-    python -m src.main create <folder> [--name NAME] [--force]
-    python -m src.main info   <folder>
+    python -m src.main                       # launch the GUI (primary use)
+    python -m src.main gui [<file>]          # GUI, optionally opening a file
+    python -m src.main info   <folder>       # diagnostics
     python -m src.main selfcheck [<scratch-folder>]
-    python -m src.main gui [<file>]          # the main way to use this tool
 """
 
 from __future__ import annotations
@@ -44,19 +43,6 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from src.core.project_db import ProjectDB, ProjectError, SCHEMA_VERSION  # noqa: E402
-
-
-def cmd_create(args) -> int:
-    try:
-        proj = ProjectDB.create(args.folder, name=args.name, exist_ok=args.force)
-    except ProjectError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    with proj:
-        print(f"Created project '{proj.get_meta('project_name')}' at {proj.root}")
-        print(f"  {proj.db_path.name}  (schema v{proj.schema_version})")
-        print(f"  {proj.sources_dir.name}/   {proj.exports_dir.name}/")
-    return 0
 
 
 def cmd_info(args) -> int:
@@ -173,20 +159,18 @@ def build_parser() -> argparse.ArgumentParser:
                     "offline desktop app for tracing land-parcel boundaries "
                     "from scanned/PDF/DXF surveys and computing area, perimeter, "
                     "and segment lengths in real units.",
-        epilog="The real interface is the GUI: run `land-measure-tool gui` (or "
-               "`python -m src.main gui`) to open the desktop application, then "
-               "explore its menus and toolbars. These CLI commands only create, "
-               "inspect, and self-check the portable project folder; the "
-               "measurement work — scale, tracing, parcels, reports — happens in "
-               "the GUI's Scale / Trace / Select / Segment / Locate / Assist "
-               "modes and dialogs.")
-    sub = ap.add_subparsers(dest="command", required=True)
+        epilog="With no command this launches the GUI — the primary interface, "
+               "where all the measurement work happens (Scale / Trace / Select / "
+               "Segment / Locate / Assist modes, reports, and File > New Project). "
+               "`info` and `selfcheck` are diagnostic helpers for the portable "
+               "project folder; explore everything else from the GUI's menus and "
+               "toolbars.")
+    # No subcommand is valid: it means "launch the GUI" (handled in main()).
+    sub = ap.add_subparsers(dest="command")
 
-    c = sub.add_parser("create", help="create a new project folder")
-    c.add_argument("folder")
-    c.add_argument("--name", help="project name (defaults to folder name)")
-    c.add_argument("--force", action="store_true", help="reuse folder even if a project exists")
-    c.set_defaults(func=cmd_create)
+    g = sub.add_parser("gui", help="launch the desktop application (the default action)")
+    g.add_argument("file", nargs="?", help="optional PDF / image / DXF to open on startup")
+    g.set_defaults(func=cmd_gui)
 
     i = sub.add_parser("info", help="show a project's schema and contents")
     i.add_argument("folder")
@@ -196,15 +180,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("scratch", nargs="?", help="scratch folder to use (default: a temp dir)")
     s.set_defaults(func=cmd_selfcheck)
 
-    g = sub.add_parser("gui", help="launch the desktop application (the primary interface)")
-    g.add_argument("file", nargs="?", help="optional PDF / image / DXF to open on startup")
-    g.set_defaults(func=cmd_gui)
-
     return ap
 
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    # The GUI is the primary interface: no subcommand launches it directly
+    # (so `python -m src.main`, or VS Code's "Run Python File", opens the app
+    # rather than erroring on a missing command).
+    if getattr(args, "func", None) is None:
+        return cmd_gui(argparse.Namespace(file=None))
     return args.func(args)
 
 
