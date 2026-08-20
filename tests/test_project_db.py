@@ -100,6 +100,61 @@ class ProjectDBTests(unittest.TestCase):
             self.assertTrue((root / "sources" / "sheet.png").is_file())
             self.assertTrue(p.resolve(src["relative_path"]).is_file())
 
+    def test_attach_reference_doc_copies_and_stores_relative_path(self):
+        root = self.tmp / "proj"
+        sheet = self.tmp / "sheet.png"
+        sheet.write_bytes(b"img")
+        ref = self.tmp / "jamabandi_extract.pdf"
+        ref.write_bytes(b"%PDF-1.4 reference bytes")
+        with ProjectDB.create(root) as p:
+            sid = p.import_source(sheet, "image")
+            self.assertIsNone(p.get_reference_doc(sid))          # none by default
+            p.attach_reference_doc(sid, ref)
+            got = p.get_reference_doc(sid)
+            self.assertEqual(got["relative_path"], "sources/jamabandi_extract.pdf")
+            self.assertEqual(got["original_name"], "jamabandi_extract.pdf")
+            self.assertTrue((root / "sources" / "jamabandi_extract.pdf").is_file())
+            self.assertTrue(got["resolved_path"].is_file())
+            # It is NOT registered as a traceable source row.
+            self.assertNotIn("jamabandi_extract.pdf",
+                             [s["relative_path"].split("/")[-1] for s in p.list_sources()])
+
+    def test_clear_reference_doc_detaches_but_keeps_file(self):
+        root = self.tmp / "proj"
+        sheet = self.tmp / "s.png"; sheet.write_bytes(b"img")
+        ref = self.tmp / "r.pdf"; ref.write_bytes(b"%PDF-1.4 x")
+        with ProjectDB.create(root) as p:
+            sid = p.import_source(sheet, "image")
+            p.attach_reference_doc(sid, ref)
+            p.clear_reference_doc(sid)
+            self.assertIsNone(p.get_reference_doc(sid))
+            # The immutability rule: the copied file is left in place, not deleted.
+            self.assertTrue((root / "sources" / "r.pdf").is_file())
+
+    def test_reattaching_identical_file_is_allowed_but_different_name_clash_raises(self):
+        root = self.tmp / "proj"
+        sheet = self.tmp / "s.png"; sheet.write_bytes(b"img")
+        ref = self.tmp / "r.pdf"; ref.write_bytes(b"%PDF-1.4 same")
+        with ProjectDB.create(root) as p:
+            sid = p.import_source(sheet, "image")
+            p.attach_reference_doc(sid, ref)
+            p.attach_reference_doc(sid, ref)                     # identical re-attach: fine
+            # A different file with the same basename must not overwrite the copy.
+            other_dir = self.tmp / "other"; other_dir.mkdir()
+            clash = other_dir / "r.pdf"; clash.write_bytes(b"%PDF-1.4 DIFFERENT")
+            with self.assertRaises(ProjectError):
+                p.attach_reference_doc(sid, clash)
+
+    def test_attach_reference_missing_source_or_file_raises(self):
+        root = self.tmp / "proj"
+        with ProjectDB.create(root) as p:
+            with self.assertRaises(ProjectError):
+                p.attach_reference_doc(999, self.tmp / "nope.pdf")
+            sheet = self.tmp / "s.png"; sheet.write_bytes(b"img")
+            sid = p.import_source(sheet, "image")
+            with self.assertRaises(ProjectError):
+                p.attach_reference_doc(sid, self.tmp / "does-not-exist.pdf")
+
     def test_import_source_infers_type_from_extension(self):
         root = self.tmp / "proj"
         for fname, expected in [("a.pdf", "pdf"), ("b.dxf", "dxf"), ("c.jpg", "image")]:
@@ -715,6 +770,23 @@ class UnitProfileTests(unittest.TestCase):
             p2.set_source_unit_profile(sid, pid)               # column exists again
             self.assertEqual(p2.get_source_unit_profile(sid)["id"], pid)
 
+    def test_upgrade_from_v8_adds_reference_doc_columns(self):
+        """A pre-C8 project (no sources.reference_* columns) upgrades additively so
+        an optional reference document can be attached."""
+        root = self.tmp / "legacy8"
+        with ProjectDB.create(root) as p:
+            sid = self._source_id(p)
+        conn = sqlite3.connect(str(root / "project.db"))
+        conn.execute("ALTER TABLE sources DROP COLUMN reference_rel_path")
+        conn.execute("ALTER TABLE sources DROP COLUMN reference_original_name")
+        conn.execute("PRAGMA user_version = 8")
+        conn.commit()
+        conn.close()
+        with ProjectDB.open(root) as p2:
+            self.assertEqual(p2.schema_version, SCHEMA_VERSION)
+            ref = self.tmp / "ref.pdf"; ref.write_bytes(b"%PDF-1.4 x")
+            p2.attach_reference_doc(sid, ref)                  # columns exist again
+            self.assertEqual(p2.get_reference_doc(sid)["original_name"], "ref.pdf")
 
 
 class TemplateAndFieldsTests(unittest.TestCase):

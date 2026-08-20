@@ -51,8 +51,11 @@ from .units import BUILTIN_AREA_UNITS
 #: adds the ``templates`` + ``template_fields`` tables (built-in + user land-type
 #: templates), purely additive (new tables via CREATE TABLE IF NOT EXISTS). v8
 #: (Milestone 16) adds the ``location_fixes`` table (per-parcel landmark
-#: distance/bearing observations), likewise purely additive.
-SCHEMA_VERSION = 8
+#: distance/bearing observations), likewise purely additive. v9 (C8) adds
+#: ``sources.reference_rel_path`` + ``reference_original_name`` — an optional,
+#: never-traced reference document (e.g. a digitally-generated jamabandi extract)
+#: attached to a source purely so its text can be read/copied; additive columns.
+SCHEMA_VERSION = 9
 
 DB_FILENAME = "project.db"
 SOURCES_DIRNAME = "sources"
@@ -251,6 +254,11 @@ _ADDITIVE_COLUMNS = (
     # INTEGER (no DB-level FK, since ALTER ADD COLUMN can't carry ON DELETE);
     # delete_unit_profile() clears any references in application code.
     ("sources", "unit_profile_id", "INTEGER"),
+    # v9 (C8): an optional reference document attached to a source — copied into
+    # sources/ (portable, never mutated) and referenced by relative path. It is
+    # NOT a traced source (no `sources` row of its own); only its text is read.
+    ("sources", "reference_rel_path", "TEXT"),
+    ("sources", "reference_original_name", "TEXT"),
 )
 
 #: Sentinel for "argument not supplied" in partial updates (distinct from None,
@@ -265,6 +273,17 @@ _UNSET = object()
 def _utcnow() -> str:
     """Timezone-aware ISO-8601 timestamp in UTC (no machine-local assumptions)."""
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _same_file_bytes(a: Path, b: Path) -> bool:
+    """True if two files have identical size and bytes (used to allow re-attaching
+    the exact same reference document without tripping the create-only guard)."""
+    try:
+        if a.stat().st_size != b.stat().st_size:
+            return False
+        return a.read_bytes() == b.read_bytes()
+    except OSError:
+        return False
 
 
 class ProjectError(Exception):
@@ -523,6 +542,69 @@ class ProjectDB:
                 shutil.copy2(src_file, dest)
             return existing["id"], True
         return self.import_source(src_file, file_type, doc_date=doc_date, page=page), False
+
+    # -- optional reference document (C8) -----------------------------------
+    #
+    # A source may carry ONE optional reference document (e.g. a digitally
+    # generated jamabandi extract) — never traced, never measured, purely so its
+    # text can be read/copied into identification fields by hand. It is copied
+    # into sources/ for portability and immutability (never mutated in place) but
+    # is NOT registered as a `sources` row, so it never appears as a traceable
+    # source. Only its relative path + original name are stored on the owning
+    # source row.
+
+    def attach_reference_doc(self, source_id: int, file_path) -> None:
+        """Attach *file_path* to *source_id* as its reference document. The file
+        is copied into ``sources/`` (create-only, never overwriting an existing
+        file — the immutability rule) and referenced by relative path. Replacing
+        an existing reference just repoints the columns; the previously copied
+        file is left in place (never mutated/removed under ``sources/``). Raises
+        :class:`ProjectError` for a missing source/file or a name collision."""
+        if self.conn.execute("SELECT 1 FROM sources WHERE id = ?", (source_id,)).fetchone() is None:
+            raise ProjectError(f"No source with id {source_id} in this project.")
+        src = Path(file_path)
+        if not src.is_file():
+            raise ProjectError(f"Reference document not found: {src}")
+        dest = self.sources_dir / src.name
+        rel = (PurePosixPath(SOURCES_DIRNAME) / src.name).as_posix()
+        if dest.exists():
+            # Reuse an identical already-present copy; otherwise refuse rather than
+            # overwrite (immutability). A same-named different file must be renamed.
+            if _same_file_bytes(src, dest):
+                pass
+            else:
+                raise ProjectError(
+                    f"A different file named {src.name!r} already exists in this "
+                    "project's sources/. Rename the reference document and retry.")
+        else:
+            shutil.copy2(src, dest)
+        self.conn.execute(
+            "UPDATE sources SET reference_rel_path = ?, reference_original_name = ? WHERE id = ?",
+            (rel, src.name, source_id))
+        self.conn.commit()
+
+    def get_reference_doc(self, source_id: int) -> dict | None:
+        """The source's reference document as ``{relative_path, original_name,
+        resolved_path}``, or ``None`` if none is attached."""
+        row = self.conn.execute(
+            "SELECT reference_rel_path, reference_original_name FROM sources WHERE id = ?",
+            (source_id,)).fetchone()
+        if row is None or row["reference_rel_path"] is None:
+            return None
+        rel = row["reference_rel_path"]
+        return {
+            "relative_path": rel,
+            "original_name": row["reference_original_name"],
+            "resolved_path": self.resolve(rel),
+        }
+
+    def clear_reference_doc(self, source_id: int) -> None:
+        """Detach the reference document (clears the columns). The copied file is
+        left under ``sources/`` — nothing there is ever removed by the app."""
+        self.conn.execute(
+            "UPDATE sources SET reference_rel_path = NULL, reference_original_name = NULL "
+            "WHERE id = ?", (source_id,))
+        self.conn.commit()
 
     # -- source scale (Milestone 3) -----------------------------------------
 

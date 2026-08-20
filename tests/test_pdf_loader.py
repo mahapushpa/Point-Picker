@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover
 
 from src.io.pdf_loader import (  # noqa: E402
     load_pdf_page, page_count, pdf_render_info, _render_dpi_for_page,
-    DEFAULT_DPI, MAX_RENDER_PX,
+    extract_text, DEFAULT_DPI, MAX_RENDER_PX,
 )
 from src.io.raster import RasterImage, open_raster  # noqa: E402
 
@@ -108,6 +108,28 @@ class PdfLoaderTests(unittest.TestCase):
         self.assertEqual(info.target_dpi, DEFAULT_DPI)
         self.assertFalse(info.precision_limited)
         self.assertAlmostEqual(info.page_width_pt, 595, delta=1)
+
+    # -- C8: reference-document text extraction ------------------------------
+
+    def test_extract_text_returns_text_layer(self):
+        path = self.tmp / "textdoc.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=200)
+        page.insert_text((40, 60), "Khasra 123  Khata 45  Village Dholakhera")
+        doc.save(str(path))
+        doc.close()
+        text = extract_text(path)
+        self.assertIn("Khasra 123", text)
+        self.assertIn("Dholakhera", text)
+
+    def test_extract_text_empty_for_scan_like_pdf(self):
+        # A page with no text layer (an "image-only" / scanned PDF) yields "".
+        path = self._make_pdf(size=(300, 200))
+        self.assertEqual(extract_text(path), "")
+
+    def test_extract_text_missing_file_raises(self):
+        with self.assertRaises(FileNotFoundError):
+            extract_text(self.tmp / "nope.pdf")
 
 
 if __name__ == "__main__":

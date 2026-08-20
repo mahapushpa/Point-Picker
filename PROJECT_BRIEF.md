@@ -368,6 +368,20 @@ person fills in manually — manual entry (M10) already works cleanly. Not
 in scope; documented so it isn't proposed again without a concrete need
 that changes this calculus.
 
+**Related but distinct — optional reference-document attachment (C8, built).**
+A user may attach one optional, digitally-generated PDF (e.g. a jamabandi
+extract with a real text layer — *not* a scan) to a source. It is never
+traced or measured; if it has an extractable text layer, its raw text is
+shown in a read-only side panel next to the identification-fields form so the
+user can **copy-paste exact values by hand**. This is explicitly *not* OCR and
+*not* auto-fill: nothing is guessed, no field is ever populated automatically —
+it only saves re-typing from a document that already carries selectable text.
+If nothing is attached, or the attached PDF is actually a scan (no text layer),
+the form behaves exactly as manual entry does today. The file is copied into
+`sources/` and referenced by relative path, under the same portability and
+immutability rules as any source; it is stored on the source row, not
+registered as a traceable source.
+
 Two distinct pieces, different risk profiles:
 
 1. **Image preprocessing** (denoise/contrast enhancement on the scan before

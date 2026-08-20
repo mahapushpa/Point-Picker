@@ -105,6 +105,23 @@ def read_page_size_points(path, page: int = 0) -> tuple[float, float]:
         return (float(rect.width), float(rect.height))
 
 
+def extract_text(path) -> str:
+    """Return the concatenated text layer of a PDF (all pages), or ``""`` if it
+    has none (a scan). Pure extraction — no OCR, no guessing — for the optional
+    reference-document panel (C8), where the user copies exact values by hand.
+    Raises ``FileNotFoundError`` if the file is missing, ``ValueError`` if it
+    can't be opened as a PDF."""
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"PDF not found: {p}")
+    try:
+        with _fitz.open(str(p)) as doc:
+            parts = [doc.load_page(i).get_text("text") for i in range(doc.page_count)]
+    except Exception as exc:  # noqa: BLE001 — surface as a clean ValueError
+        raise ValueError(f"could not read PDF text: {exc}") from exc
+    return "\n".join(parts).strip()
+
+
 def load_pdf_page(path, page: int = 0, dpi: int | None = None) -> RasterImage:
     """Render one page of a PDF to an RGBA :class:`RasterImage`.
 

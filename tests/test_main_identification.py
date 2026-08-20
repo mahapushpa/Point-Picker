@@ -66,8 +66,7 @@ class IdentificationDialogTests(unittest.TestCase):
         dlg = IdentificationDialog(self.p, self.pid)
         self.assertEqual(dlg._owner_edit.text(), "Ramesh")
         # Source reference line names the imported file.
-        labels = [dlg.layout().itemAt(0).widget().text()]
-        self.assertIn("sheet.png", labels[0])
+        self.assertIn("sheet.png", dlg._source_ref_label.text())
 
     def test_apply_template_populates_the_fields_table(self):
         dlg = IdentificationDialog(self.p, self.pid)
