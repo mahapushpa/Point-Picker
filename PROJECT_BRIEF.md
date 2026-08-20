@@ -33,6 +33,18 @@ their *logic* carries forward into this tool, not the files themselves (see
   generated at true physical scale. In the source project this was
   cross-validated against a page grid and a handwritten scale note and all
   three agreed within ~1%.
+  - **Multi-page PDFs (scope, B4):** a survey PDF can hold several pages. When
+    a multi-page PDF is opened, the tool asks **once, at import**, which single
+    page holds the parcels to trace; that page is then fixed for the source (its
+    `page` is stored on the source row and drives rendering, metadata-scale, and
+    report crops) and behaves exactly like any single-page source. There is
+    deliberately **no in-session page switching** and no per-page tracing across
+    a document — one source = one chosen page. A single-page PDF never prompts.
+    Re-opening an already-imported PDF reuses its originally-chosen page without
+    asking again. (A thumbnail preview in the picker was considered and skipped:
+    it adds a render pass and UI weight for what is a rare, one-time choice; a
+    plain page-number selector reusing the existing `page_count()` plumbing is
+    sufficient. Revisit only if users report picking wrong pages.)
 - **DXF** (not DWG) — open, documented, text-based, with a mature open library
   (`ezdxf`). No SDK/licensing hurdles, unlike DWG. CAD files often carry
   real-world units/scale in header data — read that directly rather than

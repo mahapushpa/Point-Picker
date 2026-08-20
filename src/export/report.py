@@ -640,6 +640,11 @@ def _build_parcel_crops(project, report, exports_dir, when):
     *exports_dir* and referenced. Returns ``(crops_by_parcel_id, png_paths)``."""
     from . import boundary_image as bimg
     crops, png_paths = {}, []
+    # Decode each distinct source sheet at most once per report. An owner commonly
+    # has many parcels on the SAME sheet; without this every parcel re-decoded the
+    # full PDF/image from disk (O(parcels) full renders). Keyed by resolved path +
+    # page, so a multi-page PDF's different pages are still cached separately.
+    source_image_cache: dict = {}
     for seq, group in enumerate(report.groups, 1):
         stem = f"owner-summary_{seq:02d}_{_owner_slug(group.display_owner)}"
         for parcel in group.parcels:
@@ -656,10 +661,15 @@ def _build_parcel_crops(project, report, exports_dir, when):
             open_kwargs = {}
             if source.get("file_type") == "pdf" and source.get("page") is not None:
                 open_kwargs["page"] = source["page"]
+            resolved = project.resolve(parcel.source.relative_path)
+            cache_key = (str(resolved), open_kwargs.get("page"))
             try:
+                base_image = source_image_cache.get(cache_key)
+                if base_image is None:
+                    base_image = bimg.load_source_image(resolved, open_kwargs)
+                    source_image_cache[cache_key] = base_image
                 image = bimg.render_crop(
-                    project.resolve(parcel.source.relative_path), polygon,
-                    closed=parcel.closed, open_kwargs=open_kwargs)
+                    resolved, polygon, closed=parcel.closed, base_image=base_image)
             except Exception as exc:   # unreadable/unsupported source, etc.
                 crops[pid] = bimg.ParcelCrop(pid, reason=f"crop unavailable: {exc}")
                 continue

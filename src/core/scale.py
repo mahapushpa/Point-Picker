@@ -38,6 +38,25 @@ METRES_PER_INCH = 0.0254
 MIN_PAGE_POINTS = 3.0
 MAX_PAGE_POINTS = 14400.0
 
+#: Above this many metres of ground per pixel, a raster source is "coarse": a
+#: single-pixel click error spans more than this on the ground, so the raster
+#: (not the user's hand) becomes the limit on tracing precision. 0.10 m/px (10 cm)
+#: is the threshold — beyond it, pixel quantisation on a typical parcel edge grows
+#: toward the ~1% area agreement the brief treats as trustworthy. For an image/scan
+#: this can't be improved (it can't be re-rendered finer), so it is surfaced as a
+#: warning once a scale is set; a PDF is rendered at the DPI target, but a coarse
+#: *map* scale can still land here. Mirrors the DXF loader's precision_limited
+#: honesty, in ground terms rather than render terms.
+COARSE_SCALE_WARN_M_PER_PX = 0.10
+
+
+def is_coarse_scale(metres_per_pixel: float | None,
+                    threshold: float = COARSE_SCALE_WARN_M_PER_PX) -> bool:
+    """True if a set scale is coarse enough that pixel resolution limits tracing
+    precision (ground metres-per-pixel above *threshold*). ``None`` (no scale) is
+    never coarse — there is simply no real-world number yet."""
+    return metres_per_pixel is not None and metres_per_pixel > threshold
+
 
 def pixel_distance(p1: Point, p2: Point) -> float:
     """Euclidean distance in pixels between two (x, y) points."""

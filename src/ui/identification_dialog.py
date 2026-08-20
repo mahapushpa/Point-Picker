@@ -74,8 +74,10 @@ class IdentificationDialog(QDialog):
 
         row_btns = QHBoxLayout()
         add_btn = QPushButton("Add field")
+        add_btn.setToolTip("Add a blank label/value row (e.g. an extra identifier or address level)")
         add_btn.clicked.connect(lambda: self._append_row("", ""))
         remove_btn = QPushButton("Remove selected")
+        remove_btn.setToolTip("Remove the selected field row from this parcel")
         remove_btn.clicked.connect(self._remove_selected_row)
         row_btns.addWidget(add_btn)
         row_btns.addWidget(remove_btn)

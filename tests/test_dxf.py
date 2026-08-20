@@ -167,6 +167,41 @@ class DxfRenderTests(unittest.TestCase):
         self.assertEqual(r.entity_count, 1)
         self.assertEqual(r.bbox, (0.0, 0.0, 10.0, 10.0))
 
+    def test_straight_polyline_has_no_curved_flag(self):
+        d = Path(tempfile.mkdtemp()) / "poly.dxf"
+        doc = ezdxf.new()
+        doc.header["$INSUNITS"] = 6
+        doc.modelspace().add_lwpolyline([(0, 0), (10, 0), (10, 10), (0, 10)], close=True)
+        doc.saveas(str(d))
+        r = render_dxf(d)
+        self.assertFalse(r.has_curved_segments)
+
+    def test_bulged_lwpolyline_flags_curved_segments(self):
+        # An LWPOLYLINE is a *supported* type, so a bulged (arc) segment inside one
+        # is drawn as a straight chord and would otherwise be silent. Format is
+        # (x, y, start_width, end_width, bulge); a non-zero bulge = arc.
+        d = Path(tempfile.mkdtemp()) / "bulge.dxf"
+        doc = ezdxf.new()
+        doc.header["$INSUNITS"] = 6
+        doc.modelspace().add_lwpolyline(
+            [(0, 0, 0, 0, 0.5), (10, 0, 0, 0, 0), (10, 10, 0, 0, 0), (0, 10, 0, 0, 0)],
+            format="xyseb", close=True)
+        doc.saveas(str(d))
+        r = render_dxf(d)
+        self.assertEqual(r.entity_count, 1)            # still drawn
+        self.assertTrue(r.has_curved_segments)         # but flagged as curved
+
+    def test_bulged_polyline_flags_curved_segments(self):
+        # The old-style POLYLINE path stores bulge on each vertex.
+        d = Path(tempfile.mkdtemp()) / "bulge2.dxf"
+        doc = ezdxf.new()
+        doc.header["$INSUNITS"] = 6
+        pl = doc.modelspace().add_polyline2d([(0, 0), (10, 0), (10, 10), (0, 10)], close=True)
+        pl.vertices[0].dxf.bulge = 0.4
+        doc.saveas(str(d))
+        r = render_dxf(d)
+        self.assertTrue(r.has_curved_segments)
+
     def test_no_drawable_entities_raises(self):
         d = Path(tempfile.mkdtemp()) / "empty.dxf"
         doc = ezdxf.new()

@@ -247,6 +247,7 @@ class PerOwnerWriterTests(_ProjectFixture):
         self.assertEqual(out.read_bytes()[:5], b"%PDF-")
 
 
+
 class OwnerSlugTests(unittest.TestCase):
     def test_blank_bucket_and_sanitising(self):
         self.assertEqual(R._owner_slug("Ramesh Kumar"), "ramesh-kumar")
@@ -363,6 +364,37 @@ class BoundaryCropTests(unittest.TestCase):
             self.p, self.p.exports_dir, formats=["pdf"])
         self.assertEqual(len(report_paths), 1)          # one owner
         self.assertEqual(image_paths, [])               # both crops embedded, none external
+
+    def test_many_parcels_one_source_decodes_source_once(self):
+        # An owner with many parcels on the SAME sheet must decode that sheet
+        # once for the whole report, not once per parcel (the pre-fix behaviour
+        # re-ran open_raster for every parcel).
+        if not _HAVE_FITZ:
+            self.skipTest("PyMuPDF not available")
+        from src.export import boundary_image as BI
+
+        for i in range(30):
+            # 30 small, distinct, embeddable boundaries across the 300x200 sheet.
+            x = 10 + (i % 10) * 25
+            y = 10 + (i // 10) * 55
+            poly = [(x, y), (x + 18, y), (x + 18, y + 18), (x, y + 18)]
+            pid = self.p.create_parcel(self.sid, owner="Ramesh")
+            self.p.save_parcel_polygon(pid, poly, closed=True, metres_per_pixel=0.5)
+
+        calls = {"n": 0}
+        real_open = BI.open_raster
+
+        def counting_open(path, **kwargs):
+            calls["n"] += 1
+            return real_open(path, **kwargs)
+
+        BI.open_raster = counting_open
+        try:
+            R.export_owner_reports(self.p, self.p.exports_dir, formats=["pdf"])
+        finally:
+            BI.open_raster = real_open
+        self.assertEqual(calls["n"], 1,
+                         f"source decoded {calls['n']} times for 30 parcels on one sheet")
 
     def test_awkward_aspect_falls_back_to_separate_png_and_is_referenced(self):
         # A very wide, thin boundary -> extreme aspect -> external PNG.

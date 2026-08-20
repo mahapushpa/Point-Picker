@@ -54,10 +54,13 @@ class TemplatesDialog(QDialog):
 
         buttons = QHBoxLayout()
         self._add_btn = QPushButton("Add new")
+        self._add_btn.setToolTip("Create a new land-type template from the name and field list")
         self._add_btn.clicked.connect(self._on_add)
         self._update_btn = QPushButton("Update selected")
+        self._update_btn.setToolTip("Save your edits to the selected template (built-in templates cannot be changed)")
         self._update_btn.clicked.connect(self._on_update)
         self._delete_btn = QPushButton("Delete selected")
+        self._delete_btn.setToolTip("Delete the selected template (built-in templates cannot be deleted)")
         self._delete_btn.clicked.connect(self._on_delete)
         buttons.addWidget(self._add_btn)
         buttons.addWidget(self._update_btn)

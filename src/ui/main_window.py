@@ -36,11 +36,12 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.geometry import measure_polygon
-from ..core.project_db import ProjectDB, ProjectError
+from ..core.project_db import ProjectDB, ProjectError, SOURCES_DIRNAME
 from ..core.scale import (
     compute_two_point_scale, compare_scales, cross_check_scales, grid_scale,
     metadata_scale_from_page, dxf_header_scale, TwoPointScale, METHOD_TWO_POINT,
     METHOD_PDF_METADATA, METHOD_DXF_HEADER, METHOD_GRID,
+    is_coarse_scale, COARSE_SCALE_WARN_M_PER_PX,
 )
 from ..core.location import (
     observation_from_points, target_from_field, format_description,
@@ -194,6 +195,10 @@ class MainWindow(QMainWindow):
         # Session state.
         self._project: ProjectDB | None = None
         self._current_path: str | None = None
+        # Which PDF page this source is showing. Chosen once at import for a
+        # multi-page PDF (B4); 0 for single-page PDFs and every non-PDF source.
+        # There is no in-session page switching — a source is one fixed page.
+        self._current_page: int = 0
         self._source_id: int | None = None
         self._scale: TwoPointScale | None = None  # in-memory; mirrors the DB when a project is open
         self._parcels: list[dict] = []            # parcels of the current source (project mode)
@@ -412,6 +417,7 @@ class MainWindow(QMainWindow):
         # Mirror the review controls in a menu for discoverability (built here,
         # after the actions exist).
         review_menu = self.menuBar().addMenu("Re&view")
+        review_menu.setToolTipsVisible(True)
         review_menu.addAction(self._overlays_action)
         review_menu.addAction(self._show_all_parcels_act)
 
@@ -620,30 +626,40 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
+        file_menu.setToolTipsVisible(True)   # menus don't show action tooltips otherwise
         new_proj = QAction("&New Project…", self)
+        new_proj.setToolTip("Create a new portable project folder (project.db + sources/ + exports/)")
         new_proj.triggered.connect(self.new_project)
         file_menu.addAction(new_proj)
         open_proj = QAction("Open &Project…", self)
+        open_proj.setToolTip("Open an existing project folder")
         open_proj.triggered.connect(self.open_project)
         file_menu.addAction(open_proj)
         file_menu.addSeparator()
         open_act = QAction("&Open File…", self)
+        open_act.setToolTip("Open a PDF, image, or DXF to trace (registered into the project if one is open)")
         open_act.setShortcut(QKeySequence.StandardKey.Open)
         open_act.triggered.connect(self.open_file_dialog)
         file_menu.addAction(open_act)
         file_menu.addSeparator()
         quit_act = QAction("&Quit", self)
+        quit_act.setToolTip("Close the application")
         quit_act.setShortcut(QKeySequence.StandardKey.Quit)
         quit_act.triggered.connect(self.close)
         file_menu.addAction(quit_act)
 
         view_menu = self.menuBar().addMenu("&View")
-        for text, slot, shortcut in (
-            ("Zoom &In", self.canvas.zoom_in, QKeySequence.StandardKey.ZoomIn),
-            ("Zoom &Out", self.canvas.zoom_out, QKeySequence.StandardKey.ZoomOut),
-            ("&Reset View", self.canvas.reset_view, "Ctrl+0"),
+        view_menu.setToolTipsVisible(True)
+        for text, slot, shortcut, tip in (
+            ("Zoom &In", self.canvas.zoom_in, QKeySequence.StandardKey.ZoomIn,
+             "Zoom in around the cursor"),
+            ("Zoom &Out", self.canvas.zoom_out, QKeySequence.StandardKey.ZoomOut,
+             "Zoom out around the cursor"),
+            ("&Reset View", self.canvas.reset_view, "Ctrl+0",
+             "Fit the whole document back into the view"),
         ):
             act = QAction(text, self)
+            act.setToolTip(tip)
             act.setShortcut(shortcut)
             act.triggered.connect(slot)
             view_menu.addAction(act)
@@ -661,27 +677,36 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self._preprocess_action)
 
         scale_menu = self.menuBar().addMenu("&Scale")
+        scale_menu.setToolTipsVisible(True)
         set_scale_act = QAction("&Set scale (two points)…", self)
+        set_scale_act.setToolTip("Click two points a known real-world distance apart to set the scale")
         set_scale_act.triggered.connect(self.begin_scale_calibration)
         scale_menu.addAction(set_scale_act)
         clear_scale_act = QAction("&Clear scale", self)
+        clear_scale_act.setToolTip("Remove this source's scale (measurements revert to pixels)")
         clear_scale_act.triggered.connect(self.clear_scale)
         scale_menu.addAction(clear_scale_act)
 
         units_menu = self.menuBar().addMenu("&Units")
+        units_menu.setToolTipsVisible(True)
         manage_units_act = QAction("&Manage unit profiles…", self)
+        manage_units_act.setToolTip("Create, edit, or delete local area-unit profiles (e.g. Bigha)")
         manage_units_act.triggered.connect(self.manage_unit_profiles)
         units_menu.addAction(manage_units_act)
 
         records_menu = self.menuBar().addMenu("&Records")
+        records_menu.setToolTipsVisible(True)
         ident_act = QAction("Edit &identification fields…", self)
+        ident_act.setToolTip("Edit this parcel's revenue-record fields, apply a land-type template, and view any attached reference document")
         ident_act.triggered.connect(self.edit_identification)
         records_menu.addAction(ident_act)
         manage_tmpl_act = QAction("Manage &templates…", self)
+        manage_tmpl_act.setToolTip("Create, edit, or delete land-type identification-field templates")
         manage_tmpl_act.triggered.connect(self.manage_templates)
         records_menu.addAction(manage_tmpl_act)
 
         reports_menu = self.menuBar().addMenu("Rep&orts")
+        reports_menu.setToolTipsVisible(True)
         owner_report_act = QAction("&Owner-wise summary…", self)
         owner_report_act.setToolTip(
             "Export every parcel grouped by owner, with per-owner area totals "
@@ -696,29 +721,38 @@ class MainWindow(QMainWindow):
         reports_menu.addAction(boundary_report_act)
 
         select_menu = self.menuBar().addMenu("Se&lection")
+        select_menu.setToolTipsVisible(True)
         select_act = QAction("&Select parcels (click / marquee)", self)
+        select_act.setToolTip("Enter selection mode: click a parcel or drag a marquee to build a working subset (separate from the active parcel)")
         select_act.triggered.connect(self.begin_selection)
         select_menu.addAction(select_act)
         select_menu.addSeparator()
         select_all_act = QAction("Select &all parcels", self)
+        select_all_act.setToolTip("Add every parcel on this source to the selection")
         select_all_act.triggered.connect(self.select_all_parcels)
         select_menu.addAction(select_all_act)
         clear_sel_act = QAction("&Clear selection", self)
+        clear_sel_act.setToolTip("Empty the selection (does not delete any parcel)")
         clear_sel_act.triggered.connect(self.clear_selection)
         select_menu.addAction(clear_sel_act)
 
         poly_menu = self.menuBar().addMenu("&Boundary")
+        poly_menu.setToolTipsVisible(True)
         trace_act = QAction("&Trace boundary", self)
+        trace_act.setToolTip("Enter tracing mode: click to place boundary points for the active parcel")
         trace_act.triggered.connect(self.begin_polygon_tracing)
         poly_menu.addAction(trace_act)
         undo_act = QAction("&Undo last point", self)
+        undo_act.setToolTip("Remove the most recently placed boundary point")
         undo_act.setShortcut(QKeySequence.StandardKey.Undo)
         undo_act.triggered.connect(self.canvas.undo_last_point)
         poly_menu.addAction(undo_act)
         close_poly_act = QAction("&Close boundary", self)
+        close_poly_act.setToolTip("Close the boundary into a polygon (connect the last point back to the first)")
         close_poly_act.triggered.connect(self.close_polygon)
         poly_menu.addAction(close_poly_act)
         clear_poly_act = QAction("C&lear boundary", self)
+        clear_poly_act.setToolTip("Remove all boundary points from the active parcel")
         clear_poly_act.triggered.connect(self.clear_polygon)
         poly_menu.addAction(clear_poly_act)
         poly_menu.addSeparator()
@@ -806,7 +840,10 @@ class MainWindow(QMainWindow):
             self._reload_parcels()
             return
         try:
-            sid, _existed = self._project.import_or_get_source(self._current_path)
+            # Record the chosen page (B4) so a new multi-page-PDF source remembers
+            # which page it is; an already-registered source keeps its first page.
+            sid, _existed = self._project.import_or_get_source(
+                self._current_path, page=(self._current_page or None))
         except ProjectError as exc:
             QMessageBox.warning(self, "Could not register file", str(exc))
             return
@@ -1133,10 +1170,43 @@ class MainWindow(QMainWindow):
         if path:
             self.load_path(path)
 
+    def _choose_pdf_page(self, path) -> int:
+        """Pick the 0-based page to open for a PDF. A single-page PDF is page 0
+        with no prompt. A multi-page PDF is asked **once, at import**: if this
+        exact file is already a source in the open project it keeps its
+        originally-chosen page (no re-prompt, no page switching); otherwise the
+        user chooses which page holds the parcels. Reuses the existing
+        ``page``/``page_count`` plumbing. On cancel, defaults to the first page."""
+        from ..io.pdf_loader import page_count
+
+        # An already-registered source keeps the page chosen when it was added.
+        if self._project is not None:
+            rel = f"{SOURCES_DIRNAME}/{Path(path).name}"
+            existing = self._project.get_source_by_relative_path(rel)
+            if existing is not None and existing.get("page") is not None:
+                return int(existing["page"])
+
+        try:
+            n = page_count(path)
+        except Exception:
+            return 0   # let the real decode below surface any error uniformly
+        if n <= 1:
+            return 0
+
+        page1, ok = QInputDialog.getInt(
+            self, "Choose PDF page",
+            f"This PDF has {n} pages.\n\n"
+            "Which page holds the parcel(s) to trace? The chosen page is fixed for "
+            "this source — there is no page switching afterwards.",
+            1, 1, n, 1)
+        return (page1 - 1) if ok else 0
+
     def load_path(self, path) -> None:
         """Decode *path* and show it. If a project is open, register the file and
         restore any saved scale/boundary for it."""
         dxf_info = None
+        pdf_info = None
+        page = 0
         try:
             if Path(path).suffix.lower() == ".dxf":
                 # Render via the DXF loader directly so its header/scale metadata is
@@ -1145,6 +1215,11 @@ class MainWindow(QMainWindow):
                 from ..io.dxf_loader import render_dxf
                 dxf_info = render_dxf(path)
                 raster = dxf_info.raster
+            elif Path(path).suffix.lower() == ".pdf":
+                page = self._choose_pdf_page(path)   # multi-page: ask once, at import
+                raster = open_raster(path, page=page)
+                from ..io.pdf_loader import pdf_render_info
+                pdf_info = pdf_render_info(path, page=page)   # render-precision assessment
             else:
                 raster = open_raster(path)
         except Exception as exc:  # decoding errors are user-facing, not crashes
@@ -1158,6 +1233,7 @@ class MainWindow(QMainWindow):
         self._dxf_info = dxf_info
         self._pre_raster = None         # invalidate any cached enhancement
         self._current_path = str(path)
+        self._current_page = page
         self._source_id = None
         self._scale = None              # a new file has its own scale/boundaries
         self._parcels = []
@@ -1172,16 +1248,29 @@ class MainWindow(QMainWindow):
         self._update_scale_readout()
         self._update_measure_readout()
         msg = f"{Path(path).name}   —   {raster.width} × {raster.height} px"
+        if page > 0:
+            msg += f"   (page {page + 1})"
         if dxf_info is not None:
             if dxf_info.skipped_entity_types:
                 # Flag, never silently drop, entity types we don't render (M15 scope).
                 msg += f"   (DXF: not drawn — {', '.join(dxf_info.skipped_entity_types)})"
+            if dxf_info.has_curved_segments:
+                # A supported polyline can still carry arc (bulge) segments we draw
+                # as straight chords — flag it the same way, since it's not a
+                # skipped *type* and would otherwise be a silent wrong boundary.
+                msg += "   (DXF: curved segments drawn as straight — trace with care)"
             if dxf_info.precision_limited:
                 # Be honest when a large drawing can't be rendered finely enough for
                 # precise tracing, rather than letting the user discover it later.
                 msg += (f"   (precision limited: ~{dxf_info.metres_per_pixel:.2f} m/px, "
                         f"coarser than the {dxf_info.precision_target_m:g} m/px target — "
                         "large drawing; trace critical corners with care)")
+        if pdf_info is not None and pdf_info.precision_limited:
+            # A sheet too large to render at the DPI target within the memory cap —
+            # honest flag, same spirit as the DXF one (render precision, not ground).
+            msg += (f"   (precision limited: rendered at ~{pdf_info.dpi:.0f} DPI, "
+                    f"below the {pdf_info.target_dpi} DPI target — very large page; "
+                    "trace critical corners with care)")
         self._status.setText(msg)
         self._update_title()
 
@@ -1294,7 +1383,7 @@ class MainWindow(QMainWindow):
         why it can't and return None. Never applies anything."""
         try:
             from ..io.pdf_loader import read_page_size_points
-            w_pt, h_pt = read_page_size_points(self._current_path, page=0)
+            w_pt, h_pt = read_page_size_points(self._current_path, page=self._current_page)
             return metadata_scale_from_page(w_pt, h_pt,
                                             self._raw_raster.width, self._raw_raster.height)
         except Exception as exc:   # implausible/missing metadata, decode error, ...
@@ -2390,9 +2479,17 @@ class MainWindow(QMainWindow):
                 source = " [DXF header]"
             elif s.method == METHOD_GRID:
                 source = " [grid]"
-            self._scale_readout.setText(
-                f"Scale: 1 px = {s.metres_per_pixel:.4g} m   "
-                f"(1 m = {s.pixels_per_metre:.4g} px){source}")
+            text = (f"Scale: 1 px = {s.metres_per_pixel:.4g} m   "
+                    f"(1 m = {s.pixels_per_metre:.4g} px){source}")
+            # Once a scale is set, flag a coarse ground resolution (pixel size limits
+            # tracing precision). For an image/scan this can't be improved — it can't
+            # be re-rendered finer — so it's an honest caveat, not a fixable error.
+            # DXF already reports its own render-precision at load, so skip it here.
+            if not self._current_is_dxf() and is_coarse_scale(s.metres_per_pixel):
+                text += (f"   ⚠ coarse: ~{s.metres_per_pixel:.3g} m/px "
+                         f"(> {COARSE_SCALE_WARN_M_PER_PX:g} m/px — corners limited by "
+                         "pixel size; trace critical corners with care)")
+            self._scale_readout.setText(text)
 
     def _update_measure_readout(self) -> None:
         pts = self.canvas.polygon_points()

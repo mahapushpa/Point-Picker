@@ -84,7 +84,9 @@ class OwnerReportDialog(QDialog):
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Generate")
+        gen_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        gen_btn.setText("Generate")
+        gen_btn.setToolTip("Generate the report(s) in the chosen formats into the project's exports/ folder")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)

@@ -85,6 +85,7 @@ class DxfDrawing:
     metres_per_pixel: float | None         # real-world m/px (None if unitless header)
     precision_target_m: float              # the m/px we aimed for
     precision_limited: bool                # True: extent too large to hit the target
+    has_curved_segments: bool = False      # True: a polyline arc (bulge) drawn as a straight chord
 
 
 def read_dxf_header_units(path) -> int:
@@ -103,31 +104,46 @@ def read_dxf_header_units(path) -> int:
 
 def _polylines_from_msp(msp):
     """Collect drawable entities as world-coordinate polylines (each a list of
-    (x, y) points), plus a set of the entity types we skipped. LINE becomes a
-    two-point polyline; closed LWPOLYLINE/POLYLINE get their first point appended
-    so the closing edge is drawn."""
+    (x, y) points), a set of the entity types we skipped, and whether any drawn
+    polyline carried curvature (a non-zero *bulge* on an LWPOLYLINE/POLYLINE
+    segment) that we render as a straight chord. LINE becomes a two-point
+    polyline; closed LWPOLYLINE/POLYLINE get their first point appended so the
+    closing edge is drawn.
+
+    Bulge matters because an LWPOLYLINE/POLYLINE is a *supported* type, so a
+    curved segment inside one would otherwise be silently straightened without
+    showing up in *skipped* — a wrong-but-plausible boundary. We flag it instead
+    (arc-to-line approximation is a later concern, not silently done here)."""
     polylines: list[list[tuple[float, float]]] = []
     skipped: set[str] = set()
+    has_curves = False
     for e in msp:
         dxftype = e.dxftype()
         if dxftype == "LINE":
             polylines.append([(e.dxf.start.x, e.dxf.start.y),
                               (e.dxf.end.x, e.dxf.end.y)])
         elif dxftype == "LWPOLYLINE":
-            pts = [(x, y) for x, y in e.get_points("xy")]
+            # "xyb" yields (x, y, bulge); a non-zero bulge means that segment is
+            # an arc, drawn here as a straight chord between its endpoints.
+            raw = list(e.get_points("xyb"))
+            pts = [(x, y) for x, y, _b in raw]
+            if any(b for _x, _y, b in raw):
+                has_curves = True
             if len(pts) >= 2:
                 if e.closed:
                     pts = pts + [pts[0]]
                 polylines.append(pts)
         elif dxftype == "POLYLINE":
             pts = [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
+            if any(getattr(v.dxf, "bulge", 0) for v in e.vertices):
+                has_curves = True
             if len(pts) >= 2:
                 if e.is_closed:
                     pts = pts + [pts[0]]
                 polylines.append(pts)
         else:
             skipped.add(dxftype)
-    return polylines, skipped
+    return polylines, skipped, has_curves
 
 
 def _metres_per_unit_or_none(insunits: int) -> float | None:
@@ -173,7 +189,7 @@ def render_dxf(path, *, max_px: int | None = None,
         raise ValueError(f"could not read DXF: {exc}") from exc
 
     insunits = int(doc.header.get("$INSUNITS", 0))
-    polylines, skipped = _polylines_from_msp(doc.modelspace())
+    polylines, skipped, has_curves = _polylines_from_msp(doc.modelspace())
     if not polylines:
         raise ValueError(
             "DXF has no LINE/LWPOLYLINE/POLYLINE entities to render"
@@ -226,6 +242,7 @@ def render_dxf(path, *, max_px: int | None = None,
         metres_per_pixel=metres_per_pixel,
         precision_target_m=TARGET_M_PER_PX,
         precision_limited=precision_limited,
+        has_curved_segments=has_curves,
     )
 
 

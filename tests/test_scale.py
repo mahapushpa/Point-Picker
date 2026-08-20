@@ -13,7 +13,25 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from src.core.scale import (  # noqa: E402
     compute_two_point_scale, pixel_distance, TwoPointScale, METHOD_TWO_POINT,
+    is_coarse_scale, COARSE_SCALE_WARN_M_PER_PX,
 )
+
+
+class CoarseScaleTests(unittest.TestCase):
+    def test_none_is_never_coarse(self):
+        self.assertFalse(is_coarse_scale(None))
+
+    def test_fine_scale_not_flagged(self):
+        self.assertFalse(is_coarse_scale(0.02))          # 2 cm/px — fine
+        self.assertFalse(is_coarse_scale(COARSE_SCALE_WARN_M_PER_PX))  # exactly at threshold
+
+    def test_coarse_scale_flagged(self):
+        self.assertTrue(is_coarse_scale(COARSE_SCALE_WARN_M_PER_PX + 0.001))
+        self.assertTrue(is_coarse_scale(0.5))            # 50 cm/px — clearly coarse
+
+    def test_threshold_override(self):
+        self.assertTrue(is_coarse_scale(0.06, threshold=0.05))
+        self.assertFalse(is_coarse_scale(0.04, threshold=0.05))
 
 
 class ScaleMathTests(unittest.TestCase):

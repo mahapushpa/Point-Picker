@@ -57,28 +57,47 @@ def _bbox(points):
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def render_crop(source_path, pixel_points, *, closed=True, padding_frac=0.18,
-                min_pad=10, open_kwargs=None):
-    """Return a cropped RGBA ``PIL.Image`` around *pixel_points* with the boundary
-    drawn on it, or raise if the source cannot be loaded. *open_kwargs* is passed
-    to :func:`open_raster` (e.g. ``page=`` for a PDF source)."""
-    from PIL import Image, ImageDraw
+def load_source_image(source_path, open_kwargs=None):
+    """Decode a source to a full-size RGBA ``PIL.Image`` once. Callers generating
+    several crops from the *same* source (e.g. an owner report where many parcels
+    share one sheet) should decode once via this and pass the result to
+    :func:`render_crop` as *base_image*, rather than re-decoding per parcel."""
+    from PIL import Image
 
     raster = open_raster(source_path, **(open_kwargs or {}))
-    img = Image.frombytes("RGBA", (raster.width, raster.height), raster.data)
+    return Image.frombytes("RGBA", (raster.width, raster.height), raster.data)
+
+
+def render_crop(source_path, pixel_points, *, closed=True, padding_frac=0.18,
+                min_pad=10, open_kwargs=None, base_image=None):
+    """Return a cropped RGBA ``PIL.Image`` around *pixel_points* with the boundary
+    drawn on it, or raise if the source cannot be loaded. *open_kwargs* is passed
+    to :func:`open_raster` (e.g. ``page=`` for a PDF source).
+
+    Pass *base_image* (a full-size source ``PIL.Image`` from
+    :func:`load_source_image`) to reuse an already-decoded source instead of
+    reading it from disk again — the crop is a cheap sub-region copy, so this
+    turns an N-parcel report from N full decodes into one.
+    """
+    from PIL import Image, ImageDraw
+
+    if base_image is not None:
+        img = base_image
+    else:
+        img = load_source_image(source_path, open_kwargs)
 
     minx, miny, maxx, maxy = _bbox(pixel_points)
     pad_x = max(min_pad, (maxx - minx) * padding_frac)
     pad_y = max(min_pad, (maxy - miny) * padding_frac)
     left = max(0, int(minx - pad_x))
     top = max(0, int(miny - pad_y))
-    right = min(raster.width, int(maxx + pad_x) + 1)
-    bottom = min(raster.height, int(maxy + pad_y) + 1)
+    right = min(img.width, int(maxx + pad_x) + 1)
+    bottom = min(img.height, int(maxy + pad_y) + 1)
     # Guard against a degenerate (empty) crop box.
     if right <= left:
-        right = min(raster.width, left + 1)
+        right = min(img.width, left + 1)
     if bottom <= top:
-        bottom = min(raster.height, top + 1)
+        bottom = min(img.height, top + 1)
 
     crop = img.crop((left, top, right, bottom)).convert("RGBA")
     draw = ImageDraw.Draw(crop)
