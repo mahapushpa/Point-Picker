@@ -66,17 +66,52 @@ class ProjectDBTests(unittest.TestCase):
         with self.assertRaises(ProjectError):
             ProjectDB.open(root)
 
-    def test_open_zero_byte_db_initialises_fresh_schema(self):
-        # A zero-byte project.db is a valid *empty* SQLite database (user_version
-        # 0), which the upgrade path initialises to the current schema — the same
-        # tolerance that lets a hand-copied folder open. This documents that
-        # benign behaviour (contrast with garbage bytes, which must raise): no
-        # crash, no raw sqlite error.
+    def test_open_zero_byte_db_raises_empty_incomplete(self):
+        # Opening (not creating) a 0-byte project.db can only mean an interrupted
+        # copy or corruption — a real, previously-created project always carries
+        # the schema + seeded built-ins. It must raise ProjectError with a message
+        # that names the likely cause (incomplete copy), distinct from the generic
+        # non-SQLite "corrupt" message, rather than silently re-initialising it.
         root = self.tmp / "proj"
         root.mkdir(parents=True)
         (root / "project.db").write_bytes(b"")
-        with ProjectDB.open(root) as p:
+        with self.assertRaises(ProjectError) as ctx:
+            ProjectDB.open(root)
+        msg = str(ctx.exception).lower()
+        self.assertIn("empty or incomplete", msg)
+        self.assertNotIn("not a readable project database", msg)   # distinct from corrupt
+
+    def test_open_sqlite_without_project_tables_raises_empty_incomplete(self):
+        # A file that opens as SQLite but has none of the expected project tables
+        # (e.g. an unrelated DB, or a partially-written copy) is also empty/incomplete.
+        root = self.tmp / "proj"
+        root.mkdir(parents=True)
+        conn = sqlite3.connect(str(root / "project.db"))
+        conn.execute("CREATE TABLE unrelated (x INTEGER)")
+        conn.commit()
+        conn.close()
+        with self.assertRaises(ProjectError) as ctx:
+            ProjectDB.open(root)
+        self.assertIn("empty or incomplete", str(ctx.exception).lower())
+
+    def test_open_valid_project_still_works(self):
+        # A genuine, previously-created project opens normally.
+        root = self.tmp / "proj"
+        with ProjectDB.create(root, name="Real") as p:
+            sample = self.tmp / "s.png"; sample.write_bytes(b"img")
+            p.import_source(sample, "image")
+        with ProjectDB.open(root) as p2:
+            self.assertEqual(p2.schema_version, SCHEMA_VERSION)
+            self.assertEqual(p2.get_meta("project_name"), "Real")
+            self.assertEqual(len(p2.list_sources()), 1)
+
+    def test_create_still_works_on_blank_path(self):
+        # create() is unaffected: a blank/0-byte db before initialisation is normal
+        # there (it is exactly what create writes into).
+        root = self.tmp / "proj"
+        with ProjectDB.create(root) as p:
             self.assertEqual(p.schema_version, SCHEMA_VERSION)
+            self.assertIn("meta", p.table_names())
 
     def test_open_wrong_schema_version_raises(self):
         root = self.tmp / "proj"

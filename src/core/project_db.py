@@ -372,6 +372,22 @@ class ProjectDB:
         try:
             conn = _connect(db_path)
             found = conn.execute("PRAGMA user_version").fetchone()[0]
+            # A project.db being OPENED must already be an initialised project:
+            # once create() has run, a real one always carries the core tables and
+            # seeded built-ins. A 0-byte file (or one that opens as SQLite but has
+            # none of the expected tables) can only mean an interrupted copy or
+            # corruption — surface it, rather than silently re-initialising it as a
+            # fresh project and masking possible data loss (e.g. a half-finished
+            # pen-drive copy). This is distinct from the non-SQLite "corrupt" case
+            # below, since the likely cause (interrupted copy) is worth naming.
+            # create() is unaffected — a blank DB before init is normal only there.
+            if not _has_core_tables(conn):
+                conn.close()
+                raise ProjectError(
+                    "This project's database is empty or incomplete — it may not "
+                    "have copied correctly. Check the source copy, or run "
+                    "selfcheck against a known-good copy."
+                )
             if found > SCHEMA_VERSION:
                 conn.close()
                 raise ProjectError(
@@ -1206,6 +1222,18 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     return conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", (name,)
     ).fetchone() is not None
+
+
+def _has_core_tables(conn: sqlite3.Connection) -> bool:
+    """True if the DB carries the core project tables (``meta`` and ``sources``,
+    present in every project since Milestone 1). A 0-byte / uninitialised file has
+    none — which distinguishes an interrupted copy from a legitimately older but
+    real project (which still has these tables and is upgraded in place)."""
+    n = conn.execute(
+        "SELECT count(*) FROM sqlite_master "
+        "WHERE type='table' AND name IN ('meta', 'sources')"
+    ).fetchone()[0]
+    return n >= 2
 
 
 def _seed_builtin_units(conn: sqlite3.Connection) -> None:
