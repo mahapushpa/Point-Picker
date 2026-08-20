@@ -246,6 +246,25 @@ class PerOwnerWriterTests(_ProjectFixture):
         self.assertGreater(out.stat().st_size, 500)
         self.assertEqual(out.read_bytes()[:5], b"%PDF-")
 
+    @unittest.skipUnless(_HAVE_FITZ, "PyMuPDF not available")
+    def test_devanagari_text_round_trips_into_pdf(self):
+        # A Devanagari owner/field value must render as real text (embedded Noto
+        # font), not blank/tofu — verified by extracting text back out. Mixed with
+        # Latin, both scripts must survive in the same document.
+        owner = "रमेश कुमार"          # "Ramesh Kumar" in Devanagari
+        pid = self._traced_parcel(owner)
+        self.p.set_parcel_fields(pid, [("गाँव", "ढोलाखेड़ा"), ("Khasra", "123")])
+        rep, group = self._one_group(owner)
+        out = Path(self._tmp.name) / "deva.pdf"
+        R.write_pdf(rep, group, out)
+
+        fitz = R._import_fitz()
+        with fitz.open(str(out)) as doc:
+            text = "\n".join(p.get_text("text") for p in doc)
+        self.assertIn("रमेश कुमार", text)      # Devanagari owner survived
+        self.assertIn("ढोलाखेड़ा", text)        # Devanagari field value survived
+        self.assertIn("Khasra", text)          # Latin still fine in the same PDF
+        self.assertNotIn("�", text)       # no replacement char / tofu
 
 
 class OwnerSlugTests(unittest.TestCase):

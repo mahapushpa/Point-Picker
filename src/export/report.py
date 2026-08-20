@@ -33,9 +33,39 @@ import json
 import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 from ..core.geometry import measure_polygon
 from ..core import units
+
+#: Bundled Unicode font (SIL OFL 1.1) for PDF text. The base14 Helvetica used for
+#: the report's English scaffolding is WinAnsi-only and renders Devanagari as
+#: blank/tofu; Noto Sans Devanagari covers Devanagari (but not Latin letters), so
+#: the writer picks per text run: Helvetica for WinAnsi-encodable characters,
+#: Noto for the rest. Kept under assets/ (mirroring src/ui/assets for the app
+#: icon). See src/export/assets/fonts/OFL.txt for the licence.
+_FONT_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
+_NOTO_REGULAR = _FONT_DIR / "NotoSansDevanagari-Regular.ttf"
+_NOTO_BOLD = _FONT_DIR / "NotoSansDevanagari-Bold.ttf"
+
+
+def _font_runs(text):
+    """Split *text* into maximal ``(segment, needs_unicode_font)`` runs. A run
+    needs the Unicode (Noto) font when a character is not WinAnsi-encodable —
+    i.e. Devanagari and other non-Latin-1 text; everything Helvetica can render
+    (Latin letters, digits, punctuation, °, ², …) stays on Helvetica."""
+    runs: list[list] = []
+    for ch in str(text):
+        try:
+            ch.encode("cp1252")   # WinAnsi ≈ cp1252: what base14 Helvetica covers
+            uni = False
+        except UnicodeEncodeError:
+            uni = True
+        if runs and runs[-1][1] == uni:
+            runs[-1][0] += ch
+        else:
+            runs.append([ch, uni])
+    return [(seg, uni) for seg, uni in runs]
 
 #: Label used for parcels with no owner set (grouped together, shown last).
 NO_OWNER_LABEL = "(no owner)"
@@ -457,6 +487,15 @@ class _PdfWriter:
     def __init__(self, fitz):
         self._fitz = fitz
         self.doc = fitz.open()
+        # Fonts for measuring/placing text. Helvetica (base14) for WinAnsi text and
+        # Noto Sans Devanagari for the rest, in regular + bold. Kept as Font objects
+        # so text_length() measures the exact font each run is drawn with.
+        self._fonts = {
+            (False, False): (fitz.Font("helv"), "helv", None),
+            (False, True): (fitz.Font("hebo"), "hebo", None),
+            (True, False): (fitz.Font(fontfile=str(_NOTO_REGULAR)), "notodeva", str(_NOTO_REGULAR)),
+            (True, True): (fitz.Font(fontfile=str(_NOTO_BOLD)), "notodevab", str(_NOTO_BOLD)),
+        }
         self._new_page()
 
     def _new_page(self):
@@ -468,13 +507,26 @@ class _PdfWriter:
             self._new_page()
 
     def line(self, text, size=10, bold=False, indent=0.0, gap=3.0, color=(0, 0, 0)):
-        font = "hebo" if bold else "helv"
         lh = size + gap
-        for chunk in self._wrap(text, size, self.RIGHT - self.LEFT - indent):
+        for chunk in self._wrap(text, size, self.RIGHT - self.LEFT - indent, bold):
             self._ensure(lh)
-            self.page.insert_text((self.LEFT + indent, self.y + size), chunk,
-                                  fontsize=size, fontname=font, color=color)
+            x = self.LEFT + indent
+            baseline = self.y + size
+            # Draw each run with the font that can encode it, advancing x by the
+            # run's measured width so mixed Latin/Devanagari lines lay out correctly.
+            for seg, uni in _font_runs(chunk):
+                if not seg:
+                    continue
+                font, fontname, fontfile = self._fonts[(uni, bold)]
+                self.page.insert_text((x, baseline), seg, fontsize=size,
+                                      fontname=fontname, fontfile=fontfile, color=color)
+                x += font.text_length(seg, fontsize=size)
             self.y += lh
+
+    def _measure(self, text, size, bold) -> float:
+        """Width of *text* using the same per-run font choice as :meth:`line`."""
+        return sum(self._fonts[(uni, bold)][0].text_length(seg, fontsize=size)
+                   for seg, uni in _font_runs(text) if seg)
 
     def rule(self, gap_before=4.0, gap_after=6.0):
         self.y += gap_before
@@ -498,16 +550,16 @@ class _PdfWriter:
         self.page.insert_image(rect, stream=png_bytes)
         self.y += dh + gap
 
-    def _wrap(self, text, size, max_width):
-        """Greedy word-wrap using PyMuPDF's text-length metric."""
-        get_len = self._fitz.get_text_length
+    def _wrap(self, text, size, max_width, bold=False):
+        """Greedy word-wrap using the per-run font metric, so a line's measured
+        width matches how it will actually be drawn (mixed scripts included)."""
         words = str(text).split()
         if not words:
             return [""]
         lines, current = [], words[0]
         for word in words[1:]:
             trial = current + " " + word
-            if get_len(trial, fontname="helv", fontsize=size) <= max_width:
+            if self._measure(trial, size, bold) <= max_width:
                 current = trial
             else:
                 lines.append(current)

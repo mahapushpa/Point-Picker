@@ -250,6 +250,17 @@ All exports: PDF (primary, shareable) and CSV/JSON (record-keeping /
 import elsewhere). Each report also carries: scale-determination method
 used and its confidence/cross-check note, and source file reference.
 
+**Non-Latin text in PDFs (C9):** the base14 PDF font is WinAnsi-only and
+cannot render Devanagari (it would show as blank/tofu). PDF report writing
+therefore embeds a bundled Unicode font — **Noto Sans Devanagari** (SIL OFL
+1.1, in `src/export/assets/fonts/`) — and chooses a font per text run: Helvetica for
+Latin/WinAnsi characters, Noto for Devanagari, so a report mixing English
+labels and Devanagari values renders correctly from one document. The font
+files are committed assets (kept offline, no download at runtime) and must be
+bundled by any PyInstaller packaging step. Other Indic scripts are not covered
+yet; the writer is structured so an additional script font can be registered
+later.
+
 ## Topology-aware shared parcel boundaries (confirmed requirement)
 Adjacent khasras share a boundary edge in real surveys. Tracing each
 parcel as a fully independent list of points (as M4/M5 currently do) means

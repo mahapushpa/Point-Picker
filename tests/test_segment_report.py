@@ -190,6 +190,21 @@ class SerialisationTests(_Fixture):
         self.assertEqual(data["bearing_note"], S.BEARING_CAVEAT)
 
     @unittest.skipUnless(_HAVE_FITZ, "PyMuPDF not available")
+    def test_devanagari_neighbour_round_trips_into_pdf(self):
+        # A Devanagari neighbour label must render as real text in the segment
+        # report PDF (embedded Noto font), not blank/tofu.
+        import pymupdf as fitz
+        pid = self._parcel()
+        rep = S.build_segment_report(self.p, pid, [0, 1], {0: "सीता का खेत"})
+        out = Path(self._tmp.name) / "seg_deva.pdf"
+        S.write_pdf(rep, out)
+        with fitz.open(str(out)) as doc:
+            text = "\n".join(page.get_text("text") for page in doc)
+        self.assertIn("सीता का खेत", text)     # Devanagari neighbour survived
+        self.assertIn("East", text)            # Latin direction label still fine
+        self.assertNotIn("�", text)
+
+    @unittest.skipUnless(_HAVE_FITZ, "PyMuPDF not available")
     def test_bearing_caveat_in_pdf_text(self):
         import pymupdf as fitz
         rep = self._report()
