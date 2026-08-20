@@ -6,141 +6,118 @@ perimeter, and segment-length figures alongside the parcel's revenue-record
 identification details.
 
 See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) for the full specification. The prior
-browser prototypes whose *logic* seeds this tool are kept under
-[reference/](reference/) for reference only.
+browser prototypes whose *logic* seeds this tool — and the earlier, superseded
+[DESKTOP_TOOL_BRIEF.md](reference/DESKTOP_TOOL_BRIEF.md) — are kept under
+[reference/](reference/) for historical reference only.
 
-## Status — Milestones 1–10 complete
+## Status — all 19 milestones complete
 
-- **Milestone 1 — portable project store**: create/open a project folder
-  (`project.db` + `sources/` + `exports/`); its SQLite schema works identically
-  from a local disk or a copied/mounted pen drive (confirmed on real hardware).
-- **Milestone 2 — open + display + pan/zoom**: open a PDF or image, render it to
-  a native `QGraphicsView` canvas, pan by dragging and zoom around the cursor
-  with the scroll wheel. Loaders live in `src/io/` (pure Python, no Qt); the
-  window and canvas are the only Qt code.
-- **Milestone 3 — manual two-point scale (SI only)**: click "Set scale", click
-  two points a known distance apart, enter the real-world distance in metres,
-  and the tool derives and displays metres-per-pixel. Redo any time. The scale
-  math is pure Python (`src/core/scale.py`).
-- **Milestone 4 — project-aware polygon tracing + measurement**: File > New/Open
-  Project registers the loaded file into the project's `sources/` (copied,
-  referenced by relative path) and persists the scale and traced boundary to
-  `project.db`; reopening restores them. "Trace" places a sequence of boundary
-  points forming a polygon (orange, distinct from the green scale markers),
-  with live segment / perimeter / area readout, plus undo / close / clear. The
-  boundary's open/closed state is stored explicitly (`parcels.closed`) and
-  restored exactly on reload — an open 3+-point boundary reloads open, not
-  auto-closed. Geometry is pure Python (`src/core/geometry.py`), SI only. Tracing
-  works **without** a scale too — the readout shows pixel units with a "(no
-  scale)" indicator and switches to metres the moment a scale is set.
+The GUI is the primary interface and has grown into a full application: a menu
+bar and toolbars, dockable **Parcels / Boundary-segment / Location** panels,
+several mutually-exclusive canvas modes (**Scale, Trace, Select, Segment,
+Locate, Assist**), and dialogs for reports, area-unit profiles, and
+identification templates — including **File > New Project** to create a portable
+project folder.
 
-- **Point-placement refinements (shared by scale + tracing)**: both picks follow
-  **place → adjust → confirm**. After placing a point you can drag it, or select
-  it and nudge with the arrow keys (1 px, or 10 px with Shift), before
-  finalising. **Enter** confirms (scale → distance prompt; polygon → close);
-  **Esc** fully cancels an in-progress pick with no residual points. A toggleable
-  full-window precision crosshair (dark core + light halo, CAD/GIS style) is on
-  by default while calibrating scale, off by default while tracing.
-- **Milestone 5 — multiple parcels per source**: one sheet can hold several
-  independently-traced parcels, each its own record. A **Parcels** sidebar lists
-  them, lets you add / delete / switch the active one, and edit its **owner**
-  (the field parcels are grouped by for owner-wise reporting later). Each parcel
-  draws in a distinct colour; the active (editable) one is emphasised and the
-  others show as context. Points, closed-state, and owner persist and restore
-  per parcel. No structural schema change was needed (`parcels.source_id` already
-  allows many); `owner` was added as an additive column (v4).
-- **Milestone 6 — topology-aware shared boundaries**: parcel boundaries are now
-  ordered references to **shared vertices** owned by the source (`vertices` +
-  `parcel_vertices`, replacing the per-parcel `points` table — schema v5, with a
-  rebuild-and-dedup migration). Tracing a point within `SNAP_TOLERANCE_PX` of an
-  existing vertex (of a *different* parcel) snaps onto it — a magenta ring warns
-  before it snaps, and a parcel never welds two of its *own* corners. Moving a
-  shared vertex (drag or arrow-nudge) moves it for **every** parcel referencing
-  it, so a shared edge is structurally identical, not just visually close. The
-  snap rule lives in `src/core/polygon.py` and is used by both the canvas and the
-  DB.
-- **Milestone 7 — parcel selection (multi-select)**: a **working subset** of
-  parcels, kept strictly separate from the single active/editable parcel. A
-  checkable **Select parcels** toolbar toggle (and a **Selection** menu) enters
-  the mode and visibly latches while it's active, with a status-bar hint
-  explaining the gesture; click a parcel (its fill or boundary) to toggle it, or
-  drag a **marquee** to catch every parcel touching or within it (additive).
-  Three on-canvas states are now visually distinct: active-for-editing (thick
-  outline + vertex dots), selected-but-not-active (translucent fill + heavier
-  outline), and unselected context (thin muted outline). The **Parcels** sidebar
-  shows both at once — the current row is the active parcel, a per-row checkbox is
-  selection membership — with **Select all** / **Clear selection** actions and a
-  live "*N* parcels selected" count. Selection is **session-only** (a scratch
-  working set — not written to the DB, cleared when another file or project is
-  opened); `MainWindow.selected_parcel_ids()` exposes it for the later consumers
-  (location-fixing, report scoping). Hit-testing is pure Python in
-  `src/core/selection.py`.
-- **Milestone 8 — image preprocessing (denoise + contrast)**: a **non-destructive,
-  display-time** enhancement of degraded scans, toggled from the **View** menu or
-  the **Enhance** toolbar button. Denoise is a mild median filter; contrast is
-  **CLAHE** (contrast-limited adaptive histogram equalisation on the luminance
-  channel), both with sensible defaults — no parameters to tune. It is **value-only
-  by construction**: it adjusts pixels but never resizes/crops/rotates, so the
-  pixel coordinates that scale (M3) and vertices (M6) are stored in stay valid —
-  the toggle only swaps the displayed pixmap, leaving every marker, boundary,
-  selection, and the zoom untouched, and scale/tracing/snapping behave identically
-  whichever view is shown. The dimension invariant is asserted, not assumed. The
-  processing is pure Python (Pillow + numpy) in `src/io/preprocess.py`; the raw
-  raster and the source file on disk are never modified.
-
-- **Milestone 9 — unit profiles**: parcel areas display in **SI plus an optional
-  local unit, side by side** (never one replacing the other — SI stays the
-  verifiable baseline per the Scale-first rule). Four **built-in** area units
-  (square metre, square foot, acre, hectare) ship as fixed, exact conversions in
-  `src/core/units.py`; **user-defined local profiles** (`{name, square metres per
-  unit}`, e.g. "Bigha — Jaipur") are created/edited/deleted from a **Manage
-  units…** dialog and saved in the project. The active unit is chosen from a
-  **Display units** toolbar combo and is **per source** (different sheets/regions
-  can use different local units), stored as an additive `sources.unit_profile_id`
-  column (schema v6). Canonical storage stays SI — profiles are a display/export
-  conversion only, never how geometry is stored; a local profile converts *area*
-  only, so perimeter and segment lengths stay SI. With no profile selected the
-  readout falls back to SI alone.
-
-- **Milestone 10 — land-type templates + identification fields**: each parcel
-  carries revenue-record metadata as `{label, value}` pairs (never fixed
-  columns), so it can hold multiple identifiers (old Khasra *and* new Plot no.)
-  and address levels without a schema change. **Built-in templates** (Rural —
-  agricultural / Rural — residential / Urban) are seeded per project and
-  protected read-only at the DB layer; **user templates** are fully editable via
-  a **Manage templates…** dialog — same pattern as M9's units. Applying a
-  template to a parcel is **additive**: it keeps every existing field and appends
-  any template labels the parcel doesn't have yet, so old identifiers survive a
-  land-type conversion (e.g. an old Khasra number is kept when a residential
-  template with a Plot number is applied later). It's a one-way copy — editing
-  the parcel never changes the template, and fields are removed only via the
-  form's remove-row control. Always present regardless of
-  template: the **source-document reference**, the **owner** (kept as the
-  first-class `parcels.owner` grouping key for owner-wise reports, surfaced in the
-  same form), and a free-text **notes** field. Templates travel with the project
-  (schema v7: additive `templates` + `template_fields` tables).
-
-Later milestones (reports, DXF, location-fixing) are scaffolded or pending and
-will be filled in one milestone at a time.
+- **M1 — portable project store**: create/open a project folder (`project.db` +
+  `sources/` + `exports/`); the SQLite schema works identically from a local
+  disk or a copied pen drive, verified by `selfcheck`.
+- **M2 — open + display + pan/zoom**: render a PDF or image to a native
+  `QGraphicsView` canvas; drag to pan, scroll to zoom around the cursor. Loaders
+  are pure Python (`src/io/`, no Qt).
+- **M3 — manual two-point scale (SI)**: pick two points a known distance apart,
+  enter the real-world metres, derive metres-per-pixel (`src/core/scale.py`).
+- **M4 — project-aware polygon tracing + measurement**: place a sequence of
+  boundary points into a polygon with live segment / perimeter / area readout,
+  plus undo / close / clear. Open/closed state is stored explicitly and restored
+  exactly. Tracing works **without** a scale (readout shows "(no scale)" pixel
+  units and switches to metres once scale is set). Geometry is pure Python
+  (`src/core/geometry.py`), SI-canonical.
+- **Point-placement refinements**: both scale and trace picks follow
+  **place → adjust → confirm** (drag or arrow-key nudge, **Enter** confirms,
+  **Esc** fully cancels), with an optional precision crosshair.
+- **M5 — multiple parcels per source**: one sheet holds several
+  independently-traced parcels, each its own record, in a **Parcels** sidebar
+  (add / delete / switch active / edit **owner** — the owner-wise-report
+  grouping key). Distinct colour per parcel; active one emphasised.
+- **M6 — topology-aware shared boundaries**: parcels reference **shared
+  vertices** owned by the source (`vertices` + `parcel_vertices`), so a shared
+  edge is structurally identical, not just visually close. Tracing within
+  `SNAP_TOLERANCE_PX` of another parcel's vertex snaps onto it (magenta ring
+  warns first; a parcel never welds two of its own corners). Snap rule lives in
+  `src/core/polygon.py`.
+- **M7 — parcel selection (multi-select)**: a **working subset** kept strictly
+  separate from the single active parcel. A **Select parcels** mode toggles
+  membership by click or **marquee**; three on-canvas states (active / selected /
+  context) are visually distinct. Selection is session-only; hit-testing is pure
+  Python (`src/core/selection.py`).
+- **M8 — image preprocessing (denoise + contrast)**: a **non-destructive,
+  display-time** median denoise + CLAHE contrast enhancement, **value-only by
+  construction** (never resizes/crops/rotates, so stored pixel coordinates stay
+  valid). Pure Python in `src/io/preprocess.py`; the raw raster and the source
+  file on disk are never modified.
+- **M9 — unit profiles**: areas display in **SI plus an optional local unit,
+  side by side**. Four built-in area units (sq m / sq ft / acre / hectare) are
+  fixed exact conversions; user local profiles (`{name, sq m per unit}`) are
+  managed in a dialog and stored per project. Active unit is **per source**.
+  Canonical storage stays SI (`src/core/units.py`).
+- **M10 — land-type templates + identification fields**: parcel metadata is
+  `{label, value}` pairs (never fixed columns). Built-in templates (Rural-agri /
+  Rural-residential / Urban) are seeded per project and protected read-only at
+  the DB layer; user templates are editable. Applying a template is **additive**
+  (keeps every existing field). Always present: source-document reference,
+  owner, and free-text notes.
+- **M11 — owner-wise summary report**: one report file **per owner** (every
+  parcel under them, identification fields, area/perimeter, and a combined-area
+  total), each parcel entry carrying a cropped boundary image. PDF / CSV / JSON
+  export (`src/export/report.py`, `src/export/boundary_image.py`).
+- **M12 — segment-length / boundary-description report**: a separate report
+  type; edges are selected **on the canvas** (contiguous-only), a side table
+  builds up per selected segment, feeding the export
+  (`src/export/segment_report.py`).
+- **M13 — visual confidence overlay**: a review mode drawing traced boundaries
+  over the source scan — global hide/show, per-parcel visibility, and adjustable
+  opacity — none of which touch stored geometry, the active parcel, or the mode.
+- **M14 — PDF metadata scale auto-detection**: read the PDF's physical page size
+  as a scale clue, shown alongside manual entry for comparison
+  (`src/core/scale.py` + loader metadata).
+- **M15 — DXF support**: open a DXF, read header units (`$INSUNITS`) for scale,
+  and render entities to a raster at an extent-aware resolution
+  (`src/io/dxf_loader.py`).
+- **M16 — location-fixing (distance/trigonometry mode)**: mark on-sheet
+  reference points for a selected subset of parcels and compute a
+  distance + bearing description (encroachment-detection use case). Reuses the
+  per-source M3 scale; GPS-anchored mode documented but deferred
+  (`src/core/location.py`).
+- **M17 — point-data guard rails**: warn (never auto-correct) on a
+  likely-accidental duplicate/near point at placement time
+  (`src/io/guardrails.py`).
+- **M18 — semi-automated tracing assist**: follow a printed boundary line
+  between two user-marked points via a bounded cost-minimising path search,
+  always shown for confirmation before acceptance; manual tracing stays the
+  fallback (`src/io/tracing_assist.py`).
+- **M19 — grid/reference-content auto-detection**: detect ruled grid spacing via
+  numpy peak-detection on pixel-darkness sums, offered as a final scale method
+  (`src/io/grid_detect.py`).
 
 ### Run commands
 
-Invoke as a module from the repository root (`python src/main.py …` also works):
+The GUI is the primary interface. Invoke as a module from the repository root
+(`python src/main.py …` also works):
 
 ```bash
-python -m src.main                                   # launch the GUI (primary interface)
+python -m src.main                                    # launch the GUI (default)
 python -m src.main gui [optional-file.pdf|png|jpg|dxf]# same, optionally opening a file
-python -m src.main info   ./my-parcel-project        # diagnostics: schema + contents
-python -m src.main selfcheck                          # portability self-check
+python -m src.main info   ./my-parcel-project         # diagnostics: schema + contents
+python -m src.main selfcheck                           # portability self-check
 ```
 
-New projects are created from the GUI (**File > New Project**); the old
-`create` subcommand was removed once the GUI covered it.
+New projects are created from the GUI (**File > New Project**).
 
 > **Import note:** the source tree is the package `src`, so its sub-package is
 > imported as `src.io` — a bare top-level `io` on the path is shadowed by
-> Python's standard-library `io` module and is not importable. Everything runs
-> from the repo root as `python -m src.main`.
+> Python's standard-library `io` module. Everything runs from the repo root as
+> `python -m src.main`.
 
 ## Architecture rule (non-negotiable)
 
@@ -156,71 +133,65 @@ UI a UI-only rewrite. The rule is enforced by a test
 src/
   main.py            CLI: gui (default) / info / selfcheck
   core/              pure Python domain logic
-    project_db.py    SQLite schema + read/write for one project folder  (DONE)
-    scale.py         two-point scale math (metres per pixel)            (DONE)
-    geometry.py      segment / perimeter / shoelace-area (SI)           (DONE)
-    polygon.py       shared-vertex snap rule + tolerance                (DONE)
-    selection.py     parcel hit-testing (click + marquee) for M7        (DONE)
-    units.py         built-in + local area-unit conversions (SI-canon)  (DONE)
-    templates.py     (land-type templates live in project_db, M10)      (n/a)
-  io/                pure-Python file loaders (no Qt)
-    raster.py        neutral RasterImage type + open_raster dispatcher   (DONE)
-    preprocess.py    denoise (median) + contrast (CLAHE), value-only     (DONE)
-    pdf_loader.py    PDF page -> RGBA raster via PyMuPDF                  (DONE)
-    image_loader.py  PNG/JPEG -> RGBA raster via Pillow                  (DONE)
-    dxf_loader.py    DXF (Milestone 9)                                  (stub)
+    project_db.py    SQLite schema + read/write for one project folder
+    scale.py         two-point + metadata + grid scale math (metres per pixel)
+    geometry.py      segment / perimeter / shoelace-area (SI)
+    polygon.py       shared-vertex snap rule + tolerance
+    selection.py     parcel hit-testing (click + marquee)
+    units.py         built-in + local area-unit conversions (SI-canonical)
+    location.py      distance/bearing location-fixing (trig mode)
+    templates.py     land-type template defaults (storage lives in project_db)
+  io/                pure-Python file loaders + processing (no Qt)
+    raster.py        neutral RasterImage type + open_raster dispatcher
+    pdf_loader.py    PDF page -> RGBA raster + physical page size (PyMuPDF)
+    image_loader.py  PNG/JPEG -> RGBA raster + DPI metadata (Pillow)
+    dxf_loader.py    DXF render + header-units scale (ezdxf)
+    preprocess.py    denoise (median) + contrast (CLAHE), value-only
+    guardrails.py    likely-duplicate point warning
+    tracing_assist.py line-following path search
+    grid_detect.py   ruled-grid spacing peak-detection
   ui/                PySide6 layer, no logic
-    main_window.py   file-open + display shell                          (DONE)
-    canvas_view.py   QGraphicsView pan/zoom canvas                      (DONE)
-    scale_dialog.py record_form.py                                      (stubs)
-  export/            PDF/CSV/JSON summary generation                    (stub)
-config/
-  templates/         land-type identification field sets (JSON, editable)
-  unit_profiles/     built-in area units (sq m / sq ft / acre / hectare)
-tests/               stdlib unittest suite (no third-party install needed)
-reference/           prior prototypes, kept for logic reference only
+    main_window.py canvas_view.py scale_dialog.py record_form.py
+    identification_dialog.py templates_dialog.py unit_profiles_dialog.py
+    report_dialog.py
+  export/            report generation
+    report.py        owner-wise summary (PDF/CSV/JSON); PDF text writer
+    segment_report.py boundary-description report
+    boundary_image.py cropped-boundary image for reports
+    assets/fonts/    bundled Noto Sans Devanagari (SIL OFL) for Unicode PDF text
+scripts/
+  source_smoke_test.py  run real documents through the loaders + diagnostics (path args)
+tests/               stdlib unittest suite (no third-party install needed to run)
+reference/           prior prototypes + superseded brief, kept for reference only
 ```
 
 ## Requirements
 
 - Python 3.11+
-- Milestone 1 needs only the standard library. Milestone 2 adds **PySide6**,
-  **PyMuPDF**, and **Pillow**:
-
-  ```bash
-  pip install PySide6 PyMuPDF Pillow      # or: pip install -r requirements.txt
-  ```
-
-  The remaining packages in [requirements.txt](requirements.txt) arrive in later
-  milestones. Every dependency works fully offline (no license server /
-  phone-home), per the brief's dependency policy.
-
-## Using it (Milestone 1)
+- Runtime dependencies (see [requirements.txt](requirements.txt)): **PySide6**,
+  **PyMuPDF**, **ezdxf**, **Pillow**, **numpy**. Every dependency works fully
+  offline (no license server / phone-home), per the brief's dependency policy.
 
 ```bash
-# Create a new portable project folder
-python src/main.py create ./my-parcel-project --name "Village X survey"
-
-# Inspect its schema and contents
-python src/main.py info ./my-parcel-project
-
-# Prove portability: build a project, copy the whole folder to a second
-# location, reopen it from there, and confirm nothing absolute was stored
-python src/main.py selfcheck
+pip install -r requirements.txt
 ```
+
+The pure-Python `src/core` and much of `src/io` are independently testable, but
+running the app and the full suite needs the packages above.
+
+## Portability & source-file immutability (non-negotiable)
 
 A project folder is self-contained: moving, backing up, or copying it to a pen
 drive is just copying the folder. Source documents stay as files under
 `sources/` and are referenced by relative path from `project.db` — never
 embedded as database blobs.
 
-**Source-file immutability (non-negotiable):** once a file is copied into
-`sources/` it is the canonical original and is never overwritten in place by
-anything the app does — not the M8 preprocessing preview (kept in memory only),
-nor any future derived artifact (which must be a distinctly-named new file). The
-only writes into `sources/` are create-only copies, and the rule is guarded by a
-test ([tests/test_source_immutability.py](tests/test_source_immutability.py))
-that checksums the imported file across an open → enhance → trace → save flow.
+Once a file is copied into `sources/` it is the canonical original and is never
+overwritten in place by anything the app does — not the M8 preprocessing preview
+(kept in memory only), nor any derived artifact (which must be a
+distinctly-named new file). The rule is guarded by a test
+([tests/test_source_immutability.py](tests/test_source_immutability.py)) that
+checksums the imported file across an open → enhance → trace → save flow.
 
 ## Tests
 
@@ -229,3 +200,6 @@ python -m unittest discover -s tests -v
 # or, if you have pytest installed:
 pytest tests
 ```
+
+GUI tests run headless under Qt's offscreen platform
+(`QT_QPA_PLATFORM=offscreen`).
