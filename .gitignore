@@ -25,4 +25,4 @@ Thumbs.db
 *.db
 !config/**
 /scratch/
-test_doc/
+/test_doc/
