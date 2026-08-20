@@ -1,18 +1,32 @@
-"""main.py — entry point.
+"""main.py — command-line entry point.
 
-Entry point. Preferred invocation is ``python -m src.main`` from the repository
-root; ``python src/main.py`` also works (this module repairs sys.path so the
-``src`` package resolves either way — necessary because ``src.io`` must be
-imported qualified, as a bare top-level ``io`` is shadowed by the stdlib).
+Preferred invocation is ``python -m src.main`` from the repository root;
+``python src/main.py`` also works (this module repairs sys.path so the ``src``
+package resolves either way — necessary because ``src.io`` must be imported
+qualified, as a bare top-level ``io`` is shadowed by the stdlib).
 
-Milestone 1 commands (no GUI): create / info / selfcheck.
-Milestone 2 command: gui — open a PDF/PNG/JPEG and pan/zoom it.
+The command line is deliberately thin: it manages the on-disk project (a
+portable SQLite folder) and launches the GUI. **The GUI is the primary
+interface** — the actual measurement work lives there, and it has grown well
+beyond a viewer into a full application: a menu bar and toolbars; dockable
+Parcels / Boundary-segment / Location panels; several interaction modes
+(Scale, Trace, Select, Segment, Locate, Assist); and dialogs for owner /
+boundary reports, area-unit profiles, and identification templates. None of
+that is discoverable from a CLI usage string — run ``gui`` and explore the
+menus and toolbars.
+
+Commands:
+    create     make a new portable project folder (SQLite schema + sources/,
+               exports/ subfolders)
+    info       print a project's schema version, unit profiles, and sources
+    selfcheck  portability self-test (build, copy elsewhere, reopen intact)
+    gui        launch the desktop application (optionally opening a file)
 
 Usage:
-    python -m src.main create <folder> [--name NAME]
+    python -m src.main create <folder> [--name NAME] [--force]
     python -m src.main info   <folder>
     python -m src.main selfcheck [<scratch-folder>]
-    python -m src.main gui [<file>]
+    python -m src.main gui [<file>]          # the main way to use this tool
 """
 
 from __future__ import annotations
@@ -121,8 +135,8 @@ def cmd_selfcheck(args) -> int:
 
 
 def cmd_gui(args) -> int:
-    """Launch the PySide6 window (Milestone 2). Imported lazily so the CLI and
-    the pure-Python tests never require PySide6 to be installed."""
+    """Launch the desktop application. Imported lazily so the CLI and the
+    pure-Python tests never require PySide6 to be installed."""
     from src.ui.main_window import run
     return run(file=args.file)
 
@@ -152,8 +166,20 @@ def _scan_for_absolute_paths(project_root: Path, original_root: Path) -> str | N
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="land-measure-tool",
-                                 description="Milestone 1 CLI: portable project folder + SQLite schema.")
+    ap = argparse.ArgumentParser(
+        prog="land-measure-tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Land Parcel Measurement & Revenue Records Tool — a fully "
+                    "offline desktop app for tracing land-parcel boundaries "
+                    "from scanned/PDF/DXF surveys and computing area, perimeter, "
+                    "and segment lengths in real units.",
+        epilog="The real interface is the GUI: run `land-measure-tool gui` (or "
+               "`python -m src.main gui`) to open the desktop application, then "
+               "explore its menus and toolbars. These CLI commands only create, "
+               "inspect, and self-check the portable project folder; the "
+               "measurement work — scale, tracing, parcels, reports — happens in "
+               "the GUI's Scale / Trace / Select / Segment / Locate / Assist "
+               "modes and dialogs.")
     sub = ap.add_subparsers(dest="command", required=True)
 
     c = sub.add_parser("create", help="create a new project folder")
@@ -170,8 +196,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("scratch", nargs="?", help="scratch folder to use (default: a temp dir)")
     s.set_defaults(func=cmd_selfcheck)
 
-    g = sub.add_parser("gui", help="open the PySide6 viewer (load + pan/zoom a PDF/image)")
-    g.add_argument("file", nargs="?", help="optional PDF/PNG/JPEG to open on startup")
+    g = sub.add_parser("gui", help="launch the desktop application (the primary interface)")
+    g.add_argument("file", nargs="?", help="optional PDF / image / DXF to open on startup")
     g.set_defaults(func=cmd_gui)
 
     return ap
