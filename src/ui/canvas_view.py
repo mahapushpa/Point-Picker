@@ -53,6 +53,7 @@ _LOC_REF_COLOR = QColor("#0CA678")    # location reference landmark (M16): teal,
 _LOC_TARGET_COLOR = QColor("#F76707")  # location target point (M16): orange ring
 _LOC_LINK_COLOR = QColor("#495057")   # reference->target connector (M16): grey dashed
 _WARN_COLOR = QColor("#E03131")       # missing-corner edge warning (M17): red, dashed
+_ASSIST_COLOR = QColor("#1971C2")     # line-follow preview (M18): blue, awaiting confirm
 
 
 def qimage_from_raster(raster: RasterImage) -> QImage:
@@ -111,6 +112,10 @@ class CanvasView(QGraphicsView):
     #: to the previous one — a probable double-click (Milestone 17). Warning only:
     #: the point is kept; the window surfaces a dismissible message.
     duplicatePointWarning = Signal(int)
+    #: Emitted (start, end in scene coords) when the user has marked both ends of a
+    #: line-follow (Milestone 18); the window computes the followed path (it holds
+    #: the neutral raster) and hands it back via :meth:`set_assist_preview`.
+    assistRequested = Signal(QPointF, QPointF)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -183,6 +188,15 @@ class CanvasView(QGraphicsView):
         self._loc_markers: list = []   # (x, y, label, kind) to draw
         self._loc_links: list = []     # (x1, y1, x2, y2) reference->target links
 
+        # Semi-automated tracing assist (Milestone 18) — a canvas mode: mark two
+        # ends of a printed line, the window computes a followed path, and it is
+        # shown as a PREVIEW (never auto-accepted). `_assist_start` holds the first
+        # mark; `_assist_preview` the path awaiting explicit accept/reject.
+        self._assisting = False
+        self._assist_start: QPointF | None = None
+        self._assist_preview: list | None = None
+        self._assist_items: list = []
+
         # Visual confidence overlay (Milestone 13) — review-time DISPLAY controls
         # only. None of these touch stored geometry, the active parcel, the
         # selection, or the current mode; they change only what is drawn over the
@@ -237,6 +251,10 @@ class CanvasView(QGraphicsView):
         self._edge_warnings.clear()
         self._locating = False
         self._loc_items.clear()
+        self._assisting = False
+        self._assist_start = None
+        self._assist_preview = None
+        self._assist_items.clear()
         # Reset the review-overlay display to defaults for the new source.
         self._overlays_visible = True
         self._overlay_opacity = 1.0
@@ -293,6 +311,7 @@ class CanvasView(QGraphicsView):
         self._reset_selection_mode()
         self._reset_segment_mode()
         self._reset_location_mode()
+        self._reset_assist_mode()
         self._redraw_segments()
         self.clear_scale_markers()
         self._calibrating = True
@@ -329,6 +348,7 @@ class CanvasView(QGraphicsView):
         self._reset_selection_mode()
         self._reset_segment_mode()
         self._reset_location_mode()
+        self._reset_assist_mode()
         self._redraw_segments()
         if self._poly_closed:
             self._poly_closed = False        # re-open to continue editing
@@ -531,6 +551,7 @@ class CanvasView(QGraphicsView):
         self._reset_polygon_mode()
         self._reset_selection_mode()
         self._reset_location_mode()
+        self._reset_assist_mode()
         self._clear_snap_indicator()
         self._segmenting = True
         self.setFocus()
@@ -659,6 +680,7 @@ class CanvasView(QGraphicsView):
         self._reset_polygon_mode()
         self._reset_selection_mode()
         self._reset_segment_mode()
+        self._reset_assist_mode()
         self._redraw_segments()
         self._clear_snap_indicator()
         self._locating = True
@@ -726,6 +748,121 @@ class CanvasView(QGraphicsView):
                 text.setZValue(12)
                 self._scene.addItem(text)
                 self._loc_items.append(text)
+
+    # -- semi-automated tracing assist (Milestone 18) -----------------------
+    #
+    # Own canvas mode. The user marks two ends of a printed line; the second mark
+    # emits `assistRequested`, the window computes the followed path and hands it
+    # back via `set_assist_preview`. The preview is NEVER auto-accepted: Enter
+    # accepts it (appending through the same snap + guard-rail path as manual
+    # points), Esc rejects it (boundary untouched).
+
+    def start_assist(self) -> bool:
+        """Enter line-follow mode. Returns False if there is no image."""
+        if self._pixmap_item is None:
+            return False
+        self._reset_calibration_mode()
+        self._reset_polygon_mode()
+        self._reset_selection_mode()
+        self._reset_segment_mode()
+        self._reset_location_mode()
+        self._reset_assist_mode()
+        self._redraw_segments()
+        self._clear_snap_indicator()
+        self._assisting = True
+        self._assist_start = None
+        self._assist_preview = None
+        self._redraw_assist()
+        self.setFocus()
+        self._update_cursor()
+        self.viewport().update()
+        return True
+
+    def stop_assist(self) -> None:
+        self._assisting = False
+        self._assist_start = None
+        self._assist_preview = None
+        self._redraw_assist()
+        self._update_cursor()
+        self.viewport().update()
+
+    def is_assisting(self) -> bool:
+        return self._assisting
+
+    def has_assist_preview(self) -> bool:
+        return bool(self._assist_preview)
+
+    def _reset_assist_mode(self) -> None:
+        """Leave line-follow interaction, dropping any in-progress mark/preview."""
+        self._assisting = False
+        self._assist_start = None
+        self._assist_preview = None
+        self._redraw_assist()
+
+    def _assist_click(self, scene_pt: QPointF) -> None:
+        if self._assist_preview is not None:
+            return   # a preview is up: accept (Enter) or reject (Esc) first
+        if self._assist_start is None:
+            self._assist_start = scene_pt
+            self._redraw_assist()
+        else:
+            self.assistRequested.emit(self._assist_start, scene_pt)
+
+    def set_assist_preview(self, points) -> None:
+        """Show a followed path awaiting confirmation (window computes it)."""
+        self._assist_preview = [QPointF(float(x), float(y)) for x, y in points]
+        self._redraw_assist()
+
+    def clear_assist_preview(self) -> None:
+        """Reject the preview and any pending start — the boundary is unchanged."""
+        self._assist_preview = None
+        self._assist_start = None
+        self._redraw_assist()
+
+    def accept_assist_preview(self) -> bool:
+        """Append the previewed path to the active boundary through the SAME path
+        manual points take — so M6 snap-to-existing-vertex and the M17 duplicate
+        check apply identically (the assist gets no exemption). Returns False if
+        there was no preview."""
+        if not self._assist_preview:
+            return False
+        dups = []
+        for p in self._assist_preview:
+            if self._append_boundary_point(p):
+                dups.append(len(self._poly_points) - 1)
+        self._assist_preview = None
+        self._assist_start = None
+        self._clear_snap_indicator()
+        self._redraw_assist()
+        self._redraw_polygon()
+        self.polygonChanged.emit()
+        for idx in dups:
+            self.duplicatePointWarning.emit(idx)
+        return True
+
+    def _redraw_assist(self) -> None:
+        self._remove_items(self._assist_items)
+        if not self._overlays_visible:
+            return
+        if self._assist_start is not None and not self._assist_preview:
+            self._add_marker(self._assist_items, self._assist_start, "A", _ASSIST_COLOR,
+                             filled=False, active=False)
+        if self._assist_preview:
+            pen = QPen(_ASSIST_COLOR)
+            pen.setWidth(3)
+            pen.setCosmetic(True)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            pts = self._assist_preview
+            for a, b in zip(pts, pts[1:]):
+                line = QGraphicsLineItem(a.x(), a.y(), b.x(), b.y())
+                line.setPen(pen)
+                line.setZValue(8)
+                self._scene.addItem(line)
+                self._assist_items.append(line)
+            for p in (pts[0], pts[-1]):
+                self._add_marker(self._assist_items, p, "", _ASSIST_COLOR,
+                                 filled=True, active=False)
+        self._apply_opacity(self._assist_items)
 
     # -- visual confidence overlay (Milestone 13) ---------------------------
     #
@@ -797,6 +934,7 @@ class CanvasView(QGraphicsView):
         self._redraw_segments()
         self._redraw_calibration()
         self._redraw_location()
+        self._redraw_assist()
         self.viewport().update()   # crosshair is painted in drawForeground
 
     def _apply_opacity(self, bucket: list) -> None:
@@ -865,6 +1003,7 @@ class CanvasView(QGraphicsView):
         self._reset_polygon_mode()       # stop tracing, keep the polygon
         self._reset_segment_mode()
         self._reset_location_mode()
+        self._reset_assist_mode()
         self._redraw_segments()
         self._clear_snap_indicator()
         self._selecting = True
@@ -1049,6 +1188,8 @@ class CanvasView(QGraphicsView):
                 if was_click:
                     if self._locating:
                         self.locationClicked.emit(self.mapToScene(event.position().toPoint()))
+                    elif self._assisting:
+                        self._assist_click(self.mapToScene(event.position().toPoint()))
                     elif self._segmenting:
                         self._toggle_edge_at(event.position())
                     else:
@@ -1066,6 +1207,18 @@ class CanvasView(QGraphicsView):
     # -- keyboard: confirm / cancel / nudge ---------------------------------
 
     def keyPressEvent(self, event) -> None:
+        # Line-follow preview (M18): Enter accepts the followed path, Esc rejects it
+        # (or cancels a pending first mark) — never auto-accepted.
+        if self._assisting:
+            key = event.key()
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self._assist_preview:
+                self.accept_assist_preview()
+                event.accept()
+                return
+            if key == Qt.Key.Key_Escape and (self._assist_preview or self._assist_start):
+                self.clear_assist_preview()
+                event.accept()
+                return
         if self.is_picking():
             key = event.key()
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -1101,28 +1254,34 @@ class CanvasView(QGraphicsView):
             self._active = ("scale", len(self._calib_points) - 1)
             self._redraw_calibration()
         elif self._tracing:
-            self._edge_warnings.clear()   # geometry changed; any warnings are stale
-            snap = self._snap_target((scene_pt.x(), scene_pt.y()))
-            duplicate = False
-            if snap is not None:
-                vid, sx, sy = snap
-                self._poly_points.append(QPointF(sx, sy))
-                self._poly_vertex_ids.append(vid)
-            else:
-                # Guard rail (M17): a fresh point within the snap radius of the one
-                # before it is almost certainly a double-click. Warn only — keep it.
-                if self._poly_points and is_duplicate_point(
-                        (scene_pt.x(), scene_pt.y()),
-                        (self._poly_points[-1].x(), self._poly_points[-1].y())):
-                    duplicate = True
-                self._poly_points.append(scene_pt)
-                self._poly_vertex_ids.append(None)
-            self._active = ("poly", len(self._poly_points) - 1)
+            duplicate = self._append_boundary_point(scene_pt)
             self._clear_snap_indicator()
             self._redraw_polygon()
             self.polygonChanged.emit()
             if duplicate:
                 self.duplicatePointWarning.emit(len(self._poly_points) - 1)
+
+    def _append_boundary_point(self, scene_pt: QPointF) -> bool:
+        """Append one point to the active boundary with M6 snap-to-existing-vertex,
+        returning True if it is an M17 likely-duplicate of the previous point.
+        Shared by manual tracing and accepted assist paths (M18) so both get
+        identical snapping and guard-rail behaviour — the assist is not exempted."""
+        self._edge_warnings.clear()   # geometry changed; any warnings are stale
+        snap = self._snap_target((scene_pt.x(), scene_pt.y()))
+        duplicate = False
+        if snap is not None:
+            vid, sx, sy = snap
+            self._poly_points.append(QPointF(sx, sy))
+            self._poly_vertex_ids.append(vid)
+        else:
+            if self._poly_points and is_duplicate_point(
+                    (scene_pt.x(), scene_pt.y()),
+                    (self._poly_points[-1].x(), self._poly_points[-1].y())):
+                duplicate = True
+            self._poly_points.append(scene_pt)
+            self._poly_vertex_ids.append(None)
+        self._active = ("poly", len(self._poly_points) - 1)
+        return duplicate
 
     def _set_marker_position(self, kind: str, index: int, scene_pt: QPointF,
                             *, emit: bool = True) -> None:
@@ -1414,7 +1573,7 @@ class CanvasView(QGraphicsView):
             # Hide the OS cursor when the drawn crosshair is showing, else a cross.
             self.setCursor(Qt.CursorShape.BlankCursor if self._crosshair_enabled
                            else Qt.CursorShape.CrossCursor)
-        elif self._selecting or self._segmenting or self._locating:
+        elif self._selecting or self._segmenting or self._locating or self._assisting:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
         else:
             self.setCursor(Qt.CursorShape.OpenHandCursor)

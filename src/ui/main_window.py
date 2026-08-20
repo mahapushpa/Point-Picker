@@ -160,6 +160,7 @@ class MainWindow(QMainWindow):
         self.canvas.edgeHovered.connect(self._on_edge_hovered)
         self.canvas.locationClicked.connect(self._on_location_clicked)
         self.canvas.duplicatePointWarning.connect(self._on_duplicate_point_warning)
+        self.canvas.assistRequested.connect(self._on_assist_requested)
 
         # Session state.
         self._project: ProjectDB | None = None
@@ -301,6 +302,11 @@ class MainWindow(QMainWindow):
             "for a selected parcel to get distance + bearing. Needs a scale set.")
         self._location_action.toggled.connect(self._on_location_toggled)
         bar.addAction(self._location_action)
+
+        # Semi-automated tracing assist (Milestone 18): its own mutually-exclusive
+        # canvas mode. The action itself is created in _build_menu (which runs
+        # first); here it just gets a toolbar button. Disabled for DXF.
+        bar.addAction(self._assist_action)
 
     def _build_units_toolbar(self) -> None:
         """A visible 'Display units' row: pick the local area unit shown alongside
@@ -683,6 +689,24 @@ class MainWindow(QMainWindow):
         check_corners_act.triggered.connect(self.check_missing_corners)
         poly_menu.addAction(check_corners_act)
         poly_menu.addSeparator()
+        # Line-follow assist (M18): created here (menu is built before the toolbar,
+        # which also shows it). Disabled for DXF via _sync_assist_action.
+        self._assist_action = QAction("&Assist trace (follow line)", self, checkable=True)
+        self._assist_action.setToolTip(
+            "Follow a printed boundary line between two clicks (magnetic-lasso style). "
+            "The path is shown for you to accept (Enter) or reject (Esc) — never "
+            "auto-added. Manual tracing stays available. Not for DXF sources.")
+        self._assist_action.toggled.connect(self._on_assist_toggled)
+        poly_menu.addAction(self._assist_action)
+        accept_assist_act = QAction("&Accept followed path", self)
+        accept_assist_act.setToolTip("Accept the previewed followed path (or press Enter)")
+        accept_assist_act.triggered.connect(self.accept_assist)
+        poly_menu.addAction(accept_assist_act)
+        reject_assist_act = QAction("&Reject followed path", self)
+        reject_assist_act.setToolTip("Reject the previewed path (or press Esc); boundary unchanged")
+        reject_assist_act.triggered.connect(self.reject_assist)
+        poly_menu.addAction(reject_assist_act)
+        poly_menu.addSeparator()
         self._segment_action = QAction("&Describe boundary (select segments)", self,
                                        checkable=True)
         self._segment_action.setToolTip(
@@ -952,6 +976,7 @@ class MainWindow(QMainWindow):
                 return
             self._set_segment_checked(False)
             self._set_location_checked(False)
+            self._set_assist_checked(False)
             self._sync_crosshair_action()
             self._status.setText(
                 "Select mode: click a parcel to toggle it, drag to select several. "
@@ -1101,6 +1126,7 @@ class MainWindow(QMainWindow):
         self._apply_display_image()     # honour the preprocessing toggle for the new file
         self._sync_pdf_scale_action()   # PDF-metadata scale is offered for PDFs only
         self._sync_dxf_scale_action()   # DXF-header scale is offered for DXFs only
+        self._sync_assist_action()      # line-follow assist is disabled for DXF
         self._attach_source_to_project()
         self._update_scale_readout()
         self._update_measure_readout()
@@ -1165,6 +1191,7 @@ class MainWindow(QMainWindow):
         self._set_select_checked(False)   # canvas already left selection mode
         self._set_segment_checked(False)
         self._set_location_checked(False)
+        self._set_assist_checked(False)
         self._sync_crosshair_action()
         self._status.setText(
             "Set scale: click two points a known distance apart; drag or arrow-keys "
@@ -1462,6 +1489,7 @@ class MainWindow(QMainWindow):
         self._location_parcel_id = target_pid
         self._set_select_checked(False)
         self._set_segment_checked(False)
+        self._set_assist_checked(False)
         if not self.canvas.start_location_fix():
             self._set_location_checked(False)
             return
@@ -1656,6 +1684,7 @@ class MainWindow(QMainWindow):
         self._set_select_checked(False)   # canvas already left selection mode
         self._set_segment_checked(False)
         self._set_location_checked(False)
+        self._set_assist_checked(False)
         self._sync_crosshair_action()
         hint = ("Trace boundary: click to add points; drag or arrow-keys to fine-tune; "
                 "Enter (or 'Close') to finish, Esc to cancel.")
@@ -1738,6 +1767,85 @@ class MainWindow(QMainWindow):
         self._status.setText(msg)
         if announce:
             QMessageBox.information(self, "Missed-corner check", msg)
+
+    # -- semi-automated tracing assist (Milestone 18) -----------------------
+
+    def _set_assist_checked(self, on: bool) -> None:
+        self._assist_action.blockSignals(True)
+        self._assist_action.setChecked(on)
+        self._assist_action.blockSignals(False)
+
+    def _sync_assist_action(self) -> None:
+        """Line-follow is offered for pixel sources only — disabled for DXF (exact
+        vector geometry has no scanned line to follow; manual tracing + snapping is
+        the right tool there, same reasoning as M17's missing-corner skip)."""
+        ok = self.canvas.has_image() and not self._source_is_dxf()
+        self._assist_action.setEnabled(ok)
+
+    def begin_assist(self) -> None:
+        """Menu/programmatic entry: latch the checkable toggle."""
+        if self._assist_action.isChecked():
+            self._on_assist_toggled(True)
+        else:
+            self._assist_action.setChecked(True)
+
+    def _on_assist_toggled(self, checked: bool) -> None:
+        if not checked:
+            if self.canvas.is_assisting():
+                self.canvas.stop_assist()
+            self._status.setText("Line-follow assist off.")
+            return
+        if not self.canvas.has_image():
+            self._set_assist_checked(False)
+            QMessageBox.information(self, "No document", "Open a PDF or image first.")
+            return
+        if self._source_is_dxf():
+            self._set_assist_checked(False)
+            QMessageBox.information(
+                self, "Not for DXF",
+                "Line-follow assist is for scanned/rendered pixel sources. A DXF's "
+                "boundary is exact vector geometry with no scanned line to follow — "
+                "trace it manually (snapping still applies).")
+            return
+        if not self.canvas.start_assist():
+            self._set_assist_checked(False)
+            return
+        # Mutually exclusive with the other checkable modes.
+        self._set_select_checked(False)
+        self._set_segment_checked(False)
+        self._set_location_checked(False)
+        self._sync_crosshair_action()
+        self._status.setText(
+            "Line-follow: click the start of a boundary line, then its end. The "
+            "followed path is shown — Enter to accept, Esc to reject (then trace "
+            "manually if it's wrong).")
+
+    def _on_assist_requested(self, start, end) -> None:
+        """Both ends marked: compute the followed path and show it for confirmation.
+        Never auto-accepts — the user presses Enter/Esc (or uses the Boundary menu)."""
+        if self._raw_raster is None:
+            return
+        from ..io.tracing_assist import follow_line
+        try:
+            path = follow_line(self._raw_raster, (start.x(), start.y()), (end.x(), end.y()))
+        except Exception as exc:   # degenerate raster etc. — never crash the UI
+            QMessageBox.warning(self, "Could not follow line", str(exc))
+            self.canvas.clear_assist_preview()
+            return
+        self.canvas.set_assist_preview(path)
+        self._status.setText(
+            f"Followed path: {len(path)} point(s). Enter to accept into the boundary, "
+            "Esc to reject and trace manually.")
+
+    def accept_assist(self) -> None:
+        """Accept the previewed followed path (menu path; Enter does the same)."""
+        if self.canvas.accept_assist_preview():
+            self._status.setText("Followed path added to the boundary.")
+
+    def reject_assist(self) -> None:
+        """Reject the previewed path — the boundary is left completely unchanged."""
+        self.canvas.clear_assist_preview()
+        self._status.setText("Followed path rejected — boundary unchanged.")
 
     # -- persistence helpers ------------------------------------------------
 
@@ -1936,6 +2044,7 @@ class MainWindow(QMainWindow):
             return
         self._set_select_checked(False)
         self._set_location_checked(False)
+        self._set_assist_checked(False)
         self._sync_crosshair_action()
         self._refresh_segment_table()
         self._status.setText(
