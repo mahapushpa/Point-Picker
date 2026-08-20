@@ -37,9 +37,9 @@ from PySide6.QtWidgets import (
 from ..core.geometry import measure_polygon
 from ..core.project_db import ProjectDB, ProjectError
 from ..core.scale import (
-    compute_two_point_scale, compare_scales, metadata_scale_from_page,
-    dxf_header_scale, TwoPointScale, METHOD_TWO_POINT, METHOD_PDF_METADATA,
-    METHOD_DXF_HEADER,
+    compute_two_point_scale, compare_scales, cross_check_scales, grid_scale,
+    metadata_scale_from_page, dxf_header_scale, TwoPointScale, METHOD_TWO_POINT,
+    METHOD_PDF_METADATA, METHOD_DXF_HEADER, METHOD_GRID,
 )
 from ..core.location import (
     observation_from_points, target_from_field, format_description,
@@ -269,6 +269,17 @@ class MainWindow(QMainWindow):
         self._dxf_scale_action.triggered.connect(self.propose_dxf_header_scale)
         self._dxf_scale_action.setEnabled(False)   # enabled once a DXF is loaded
         bar.addAction(self._dxf_scale_action)
+
+        # Grid-detection scale (Milestone 19): a third candidate for IMAGE sources,
+        # from a detected ruled grid's spacing + the user's real grid interval.
+        self._grid_scale_action = QAction("Grid scale", self)
+        self._grid_scale_action.setToolTip(
+            "Detect a ruled reference grid on a scanned image and derive a scale from "
+            "its spacing, cross-checked against any manual scale. Image sources only; "
+            "offered, never auto-applied.")
+        self._grid_scale_action.triggered.connect(self.propose_grid_scale)
+        self._grid_scale_action.setEnabled(False)   # enabled for image sources
+        bar.addAction(self._grid_scale_action)
 
         bar.addSeparator()
         for text, tooltip, slot in (
@@ -1126,6 +1137,7 @@ class MainWindow(QMainWindow):
         self._apply_display_image()     # honour the preprocessing toggle for the new file
         self._sync_pdf_scale_action()   # PDF-metadata scale is offered for PDFs only
         self._sync_dxf_scale_action()   # DXF-header scale is offered for DXFs only
+        self._sync_grid_scale_action()  # grid-detection scale is offered for images
         self._sync_assist_action()      # line-follow assist is disabled for DXF
         self._attach_source_to_project()
         self._update_scale_readout()
@@ -1381,6 +1393,88 @@ class MainWindow(QMainWindow):
             cand.metres_per_pixel, METHOD_DXF_HEADER, "DXF header",
             note=f"DXF $INSUNITS={cand.insunits} ({cand.unit_name}), "
                  f"{cand.units_per_pixel:.6g} unit/px")
+
+    # -- grid-detection scale (Milestone 19) --------------------------------
+
+    def _current_is_image(self) -> bool:
+        return (self._current_path is not None and not self._current_is_pdf()
+                and not self._current_is_dxf())
+
+    def _sync_grid_scale_action(self) -> None:
+        """Grid detection is offered for image sources only (PDF/DXF have M14/M15
+        metadata methods; grids aren't their case)."""
+        self._grid_scale_action.setEnabled(
+            self._current_is_image() and self._raw_raster is not None)
+
+    def _other_scale_label(self):
+        """Label + mpp of the current stored scale (to cross-check a new candidate
+        against), or None. Grid candidates are cross-checked against whatever real
+        method already set the scale (manual / metadata)."""
+        if self._scale is None:
+            return None
+        labels = {METHOD_TWO_POINT: "Manual", METHOD_PDF_METADATA: "PDF metadata",
+                  METHOD_DXF_HEADER: "DXF header", METHOD_GRID: "Grid"}
+        return labels.get(self._scale.method, self._scale.method), self._scale.metres_per_pixel
+
+    def propose_grid_scale(self) -> None:
+        """Detect a ruled grid, ask for its real-world interval, and offer the
+        resulting scale — cross-checked against any existing scale. Honest when no
+        clear grid is found (says so; offers nothing)."""
+        if not self._current_is_image() or self._raw_raster is None:
+            QMessageBox.information(
+                self, "Not an image",
+                "Grid detection is for scanned image sources. PDF and DXF sources "
+                "use their own metadata scale (PDF scale / DXF scale).")
+            return
+        from ..io.grid_detect import detect_grid_spacing
+        det = detect_grid_spacing(self._raw_raster)
+        if not det.found:
+            QMessageBox.information(
+                self, "No clear grid",
+                f"No clear reference grid was detected ({det.reason}).\n\nUse the "
+                "manual two-point scale (Set scale) instead.")
+            return
+        interval, ok = QInputDialog.getDouble(
+            self, "Grid interval",
+            f"A grid was detected at ~{det.spacing_px:.1f} px per cell.\n"
+            "Real-world size of one grid cell (metres):",
+            10.0, 0.0000001, 1_000_000.0, 4)
+        if not ok:
+            self._status.setText("Grid scale cancelled.")
+            return
+        try:
+            cand = grid_scale(det.spacing_px, interval)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Could not set grid scale", str(exc))
+            return
+
+        grid_line = (f"Grid: {det.spacing_px:.1f} px/cell × {interval:g} m "
+                     f"→ 1 px = {cand.metres_per_pixel:.4g} m")
+        other = self._other_scale_label()
+        if other is not None and self._scale.method != METHOD_GRID:
+            label, mpp = other
+            cc = cross_check_scales({label: mpp, "Grid": cand.metres_per_pixel})
+            body = (f"{label} scale: 1 px = {mpp:.4g} m\n{grid_line}\n\n"
+                    f"{cc.describe()}\n\nReplace the current scale with the grid scale?")
+            if QMessageBox.question(self, "Two scales — cross-check", body) \
+                    == QMessageBox.StandardButton.Yes:
+                self._apply_grid_scale(cand, det, interval)
+            else:
+                self._status.setText("Kept current scale. " + cc.describe())
+        else:
+            if QMessageBox.question(
+                    self, "Scale from grid",
+                    f"{grid_line}\n\nUse it as this source's scale?") \
+                    == QMessageBox.StandardButton.Yes:
+                self._apply_grid_scale(cand, det, interval)
+            else:
+                self._status.setText("Grid scale not applied.")
+
+    def _apply_grid_scale(self, cand, det, interval) -> None:
+        self._apply_candidate_scale(
+            cand.metres_per_pixel, METHOD_GRID, "grid",
+            note=f"grid {det.spacing_px:.1f} px/cell = {interval:g} m "
+                 f"(rows {det.row_spacing_px:.1f}px, cols {det.col_spacing_px:.1f}px)")
 
     # -- location-fixing (Milestone 16) -------------------------------------
 
@@ -2265,6 +2359,8 @@ class MainWindow(QMainWindow):
                 source = " [PDF metadata]"
             elif s.method == METHOD_DXF_HEADER:
                 source = " [DXF header]"
+            elif s.method == METHOD_GRID:
+                source = " [grid]"
             self._scale_readout.setText(
                 f"Scale: 1 px = {s.metres_per_pixel:.4g} m   "
                 f"(1 m = {s.pixels_per_metre:.4g} px){source}")

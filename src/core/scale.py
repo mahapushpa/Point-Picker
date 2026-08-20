@@ -24,6 +24,7 @@ Point = tuple[float, float]
 METHOD_TWO_POINT = "two-point"
 METHOD_PDF_METADATA = "pdf-metadata"
 METHOD_DXF_HEADER = "dxf-header"
+METHOD_GRID = "grid"
 
 #: Unit conversions for reading a PDF's physical page size. A PDF user-space unit
 #: is the point = 1/72 inch; an inch is exactly 0.0254 m.
@@ -261,6 +262,12 @@ def dxf_header_scale(insunits: int, units_per_pixel: float) -> DxfHeaderScale:
     )
 
 
+def _percent_diff(a: float, b: float) -> float:
+    """Symmetric percentage difference between two positive values. Single source of
+    truth for both the 2-way (M14/M15) and N-way (M19) scale cross-checks."""
+    return abs(a - b) / ((a + b) / 2.0) * 100.0
+
+
 def compare_scales(manual_mpp: float, metadata_mpp: float, *,
                    tolerance_percent: float = 2.0) -> ScaleCrossCheck:
     """Symmetric percentage difference between two metres-per-pixel scales, and
@@ -268,10 +275,106 @@ def compare_scales(manual_mpp: float, metadata_mpp: float, *,
     a plain percentage difference is enough)."""
     if manual_mpp <= 0 or metadata_mpp <= 0:
         raise ValueError("both scales must be positive to compare")
-    mean = (manual_mpp + metadata_mpp) / 2.0
-    percent = abs(manual_mpp - metadata_mpp) / mean * 100.0
+    percent = _percent_diff(manual_mpp, metadata_mpp)
     return ScaleCrossCheck(
         manual_mpp=float(manual_mpp), metadata_mpp=float(metadata_mpp),
         percent_difference=percent, agree=percent <= tolerance_percent,
         tolerance_percent=float(tolerance_percent),
     )
+
+
+# -- method 2: grid-spacing scale (Milestone 19) ----------------------------
+#
+# A ruled reference grid gives a pixel spacing (detected in io.grid_detect); the
+# user supplies the real-world size of one grid cell, so the scale is simply the
+# real interval divided by the detected pixel spacing (structurally like the M3
+# two-point method, but the pixel distance is auto-detected rather than clicked).
+
+
+@dataclass(frozen=True)
+class GridScale:
+    """A scale candidate derived from a detected ruled-grid pixel spacing plus the
+    user-supplied real-world grid interval (metres per cell)."""
+
+    pixel_spacing_px: float
+    real_spacing_m: float
+    metres_per_pixel: float
+    method: str = METHOD_GRID
+
+    @property
+    def pixels_per_metre(self) -> float:
+        return 1.0 / self.metres_per_pixel
+
+
+def grid_scale(pixel_spacing_px: float, real_spacing_m: float) -> GridScale:
+    """metres-per-pixel from a grid's pixel spacing and its real-world interval.
+    Raises ``ValueError`` for non-positive inputs."""
+    if pixel_spacing_px <= 0:
+        raise ValueError(f"pixel spacing must be positive, got {pixel_spacing_px}")
+    if real_spacing_m <= 0:
+        raise ValueError(f"real grid interval must be positive, got {real_spacing_m}")
+    return GridScale(
+        pixel_spacing_px=float(pixel_spacing_px),
+        real_spacing_m=float(real_spacing_m),
+        metres_per_pixel=real_spacing_m / pixel_spacing_px,
+    )
+
+
+# -- method 4 (extended): N-way cross-check (Milestone 19) -------------------
+
+
+@dataclass(frozen=True)
+class MultiScaleCrossCheck:
+    """Cross-check of two or more independently-derived scales for one source. The
+    brief's 'three methods agreeing within ~1%' finally becomes possible once a
+    grid candidate can sit alongside manual and/or metadata scales."""
+
+    labels: tuple[str, ...]
+    values: tuple[float, ...]                 # metres per pixel, aligned to labels
+    max_percent_difference: float
+    agree: bool
+    worst_pair: tuple[str, str] | None        # the two most-divergent methods
+    tolerance_percent: float
+
+    def describe(self) -> str:
+        n = len(self.labels)
+        if n < 2:
+            only = self.labels[0] if self.labels else "the scale"
+            return (f"Only {only} is available — no independent method to "
+                    "cross-check against; treat the number with due caution.")
+        methods = ", ".join(self.labels)
+        if self.agree:
+            return (f"All {n} scales agree ({methods}): largest difference "
+                    f"{self.max_percent_difference:.1f}% "
+                    f"(within {self.tolerance_percent:g}%).")
+        a, b = self.worst_pair
+        return (f"Scales DISAGREE across {n} methods ({methods}): up to "
+                f"{self.max_percent_difference:.1f}% between {a} and {b} "
+                f"(more than {self.tolerance_percent:g}%) — check which is right "
+                "before trusting measurements.")
+
+
+def cross_check_scales(labeled: dict[str, float], *,
+                       tolerance_percent: float = 2.0) -> MultiScaleCrossCheck:
+    """Compare two or more labelled metres-per-pixel scales: the largest pairwise
+    percentage difference (reusing :func:`_percent_diff`), whether all agree within
+    *tolerance_percent*, and the most-divergent pair. With a single scale it says so
+    (principle 5: be honest when there's nothing to cross-check against)."""
+    items = [(str(k), float(v)) for k, v in labeled.items()]
+    if any(v <= 0 for _, v in items):
+        raise ValueError("all scales must be positive to compare")
+    labels = tuple(k for k, _ in items)
+    values = tuple(v for _, v in items)
+    if len(items) < 2:
+        return MultiScaleCrossCheck(labels, values, 0.0, True, None,
+                                    float(tolerance_percent))
+    worst = 0.0
+    worst_pair = (labels[0], labels[1])
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            d = _percent_diff(items[i][1], items[j][1])
+            if d > worst:
+                worst = d
+                worst_pair = (items[i][0], items[j][0])
+    return MultiScaleCrossCheck(labels, values, worst, worst <= tolerance_percent,
+                                worst_pair, float(tolerance_percent))
