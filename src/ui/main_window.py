@@ -159,6 +159,7 @@ class MainWindow(QMainWindow):
         self.canvas.segmentSelectionChanged.connect(self._on_segment_selection_changed)
         self.canvas.edgeHovered.connect(self._on_edge_hovered)
         self.canvas.locationClicked.connect(self._on_location_clicked)
+        self.canvas.duplicatePointWarning.connect(self._on_duplicate_point_warning)
 
         # Session state.
         self._project: ProjectDB | None = None
@@ -188,6 +189,7 @@ class MainWindow(QMainWindow):
         self._location_parcel_id: int | None = None
         self._loc_awaiting: str | None = None
         self._loc_pending: tuple | None = None
+        self._loc_last_px: tuple | None = None   # previous location click, for M17 dup check
 
         # Image preprocessing (M8): a display-time, non-destructive preview. The
         # raw raster and the source file are never modified; the enhanced raster
@@ -673,6 +675,13 @@ class MainWindow(QMainWindow):
         clear_poly_act = QAction("C&lear boundary", self)
         clear_poly_act.triggered.connect(self.clear_polygon)
         poly_menu.addAction(clear_poly_act)
+        poly_menu.addSeparator()
+        check_corners_act = QAction("Check for &missed corners", self)
+        check_corners_act.setToolTip(
+            "Flag traced edges that look long/straight but don't track the scan — a "
+            "possible skipped corner. A warning only; nothing is changed.")
+        check_corners_act.triggered.connect(self.check_missing_corners)
+        poly_menu.addAction(check_corners_act)
         poly_menu.addSeparator()
         self._segment_action = QAction("&Describe boundary (select segments)", self,
                                        checkable=True)
@@ -1424,6 +1433,7 @@ class MainWindow(QMainWindow):
                 self.canvas.stop_location_fix()
             self._loc_awaiting = None
             self._loc_pending = None
+            self._loc_last_px = None
             self._status.setText("Location-fix mode off.")
             return
 
@@ -1458,6 +1468,7 @@ class MainWindow(QMainWindow):
         self._sync_crosshair_action()
         self._loc_awaiting = "reference"
         self._loc_pending = None
+        self._loc_last_px = None
         self._refresh_location_ui()
         self._status.setText(
             "Location-fix: click a durable landmark (tubewell, building, …) on the "
@@ -1477,6 +1488,14 @@ class MainWindow(QMainWindow):
         if not self.canvas.is_locating():
             return
         px = (scene_pt.x(), scene_pt.y())
+        # Guard rail (M17): flag a click implausibly close to the previous one (a
+        # probable double-click) — warn, but still use it; never auto-discard.
+        from ..io.guardrails import is_duplicate_point
+        if self._loc_last_px is not None and is_duplicate_point(px, self._loc_last_px):
+            self._status.setText(
+                "⚠ This point is very close to the previous one — possible "
+                "double-click. Re-place it if that was accidental.")
+        self._loc_last_px = px
         if self._loc_awaiting == "target" and self._loc_pending is not None:
             ref_px, label = self._loc_pending
             target = self._snap_location_target(px)
@@ -1667,6 +1686,58 @@ class MainWindow(QMainWindow):
 
     def _on_polygon_closed(self) -> None:
         self._status.setText("Boundary closed.")
+        # Guard rail (M17): quietly check the just-closed boundary for edges that
+        # may skip a corner, highlighting them; no dialog, nothing auto-changed.
+        self.check_missing_corners(announce=False)
+
+    # -- point-data guard rails (Milestone 17) ------------------------------
+
+    def _on_duplicate_point_warning(self, index: int) -> None:
+        """A traced point landed implausibly close to the previous one — warn, but
+        keep it (never auto-remove). The user decides via Undo pt."""
+        self._status.setText(
+            f"⚠ Point {index + 1} is very close to the previous point — possible "
+            "double-click. Use 'Undo pt' if it was accidental.")
+
+    def _source_is_dxf(self) -> bool:
+        return self._dxf_info is not None
+
+    def check_missing_corners(self, announce: bool = True) -> None:
+        """Flag active-boundary edges whose straight chord doesn't track the scan
+        (a possibly-skipped corner). Warning only — highlights edges and reports a
+        count; never moves or removes a point. Skipped for DXF (vector geometry is
+        exact, so there's no scan ambiguity to sample)."""
+        pts = self.canvas.polygon_points()
+        if len(pts) < 2 or self._raw_raster is None:
+            self.canvas.set_edge_warnings([])
+            if announce:
+                QMessageBox.information(self, "Nothing to check",
+                                       "Trace a boundary first.")
+            return
+        if self._source_is_dxf():
+            self.canvas.set_edge_warnings([])
+            if announce:
+                QMessageBox.information(
+                    self, "Skipped for DXF",
+                    "The missed-corner check samples scan pixels, which is meaningless "
+                    "for a DXF's exact vector geometry, so it is skipped for DXF sources.")
+            else:
+                self._status.setText("Missed-corner check skipped for DXF (vector geometry).")
+            return
+
+        from ..io.guardrails import find_missing_corner_edges
+        warnings = find_missing_corner_edges(
+            self._raw_raster, pts, self.canvas.is_polygon_closed())
+        self.canvas.set_edge_warnings([w.edge_index for w in warnings])
+        if warnings:
+            msg = (f"⚠ {len(warnings)} edge(s) look long/straight but don't track "
+                   "the scan — a corner may have been missed. Review the highlighted "
+                   "edges (in red); add points where needed, or ignore if fine.")
+        else:
+            msg = "No suspicious edges found — every edge tracks the scan."
+        self._status.setText(msg)
+        if announce:
+            QMessageBox.information(self, "Missed-corner check", msg)
 
     # -- persistence helpers ------------------------------------------------
 

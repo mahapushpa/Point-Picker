@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 from ..core.polygon import nearest_vertex_index, SNAP_TOLERANCE_PX
 from ..core.selection import nearest_edge_index, contiguous_edge_toggle
 from ..io.raster import RasterImage
+from ..io.guardrails import is_duplicate_point
 
 _MARK_COLOR = QColor("#1D9E75")  # scale-calibration markers: accent green (as point_picker.html)
 _POLY_COLOR = QColor("#E8770F")  # boundary-tracing markers: orange, visually distinct
@@ -51,6 +52,7 @@ _SEG_HOVER_COLOR = QColor("#B197FC")  # edge under the cursor in segment mode (f
 _LOC_REF_COLOR = QColor("#0CA678")    # location reference landmark (M16): teal, filled
 _LOC_TARGET_COLOR = QColor("#F76707")  # location target point (M16): orange ring
 _LOC_LINK_COLOR = QColor("#495057")   # reference->target connector (M16): grey dashed
+_WARN_COLOR = QColor("#E03131")       # missing-corner edge warning (M17): red, dashed
 
 
 def qimage_from_raster(raster: RasterImage) -> QImage:
@@ -105,6 +107,10 @@ class CanvasView(QGraphicsView):
     #: Emitted (scene x, y) when the user clicks in location-fixing mode (M16); the
     #: window decides whether it is a reference landmark or a target point.
     locationClicked = Signal(QPointF)
+    #: Emitted (point index) when a just-placed tracing point is implausibly close
+    #: to the previous one — a probable double-click (Milestone 17). Warning only:
+    #: the point is kept; the window surfaces a dismissible message.
+    duplicatePointWarning = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -135,6 +141,10 @@ class CanvasView(QGraphicsView):
         self._poly_closed = False
         self._poly_items: list[QGraphicsItem] = []
         self._active_color = _POLY_COLOR
+        # Missing-corner warnings (M17): edge indices flagged as possibly skipping a
+        # real corner. Purely advisory highlight, drawn with the active boundary and
+        # cleared whenever the boundary is edited (they'd be stale).
+        self._edge_warnings: set[int] = set()
         # Other parcels of the same source, drawn for context (not editable).
         # Each is a dict: {points, vertex_ids, closed, color, label}.
         self._bg_polys: list[dict] = []
@@ -224,6 +234,7 @@ class CanvasView(QGraphicsView):
         self._seg_selected.clear()
         self._seg_items.clear()
         self._seg_hover_edge = None
+        self._edge_warnings.clear()
         self._locating = False
         self._loc_items.clear()
         # Reset the review-overlay display to defaults for the new source.
@@ -342,6 +353,7 @@ class CanvasView(QGraphicsView):
         if self._poly_vertex_ids:
             self._poly_vertex_ids.pop()
         self._poly_closed = False
+        self._edge_warnings.clear()   # geometry changed; warnings are stale (M17)
         if self._active is not None and self._active[0] == "poly":
             self._active = ("poly", len(self._poly_points) - 1) if self._poly_points else None
         self._redraw_polygon()
@@ -352,6 +364,7 @@ class CanvasView(QGraphicsView):
         self._poly_points.clear()
         self._poly_vertex_ids.clear()
         self._poly_closed = False
+        self._edge_warnings.clear()
         if self._active is not None and self._active[0] == "poly":
             self._active = None
         self._redraw_polygon()
@@ -387,6 +400,7 @@ class CanvasView(QGraphicsView):
         # indices are per-parcel); drop it silently (the caller is loading).
         self._seg_selected.clear()
         self._seg_hover_edge = None
+        self._edge_warnings.clear()   # warnings belong to the previous boundary (M17)
         self._redraw_polygon()
         self._redraw_segments()
         self._update_cursor()
@@ -1087,18 +1101,28 @@ class CanvasView(QGraphicsView):
             self._active = ("scale", len(self._calib_points) - 1)
             self._redraw_calibration()
         elif self._tracing:
+            self._edge_warnings.clear()   # geometry changed; any warnings are stale
             snap = self._snap_target((scene_pt.x(), scene_pt.y()))
+            duplicate = False
             if snap is not None:
                 vid, sx, sy = snap
                 self._poly_points.append(QPointF(sx, sy))
                 self._poly_vertex_ids.append(vid)
             else:
+                # Guard rail (M17): a fresh point within the snap radius of the one
+                # before it is almost certainly a double-click. Warn only — keep it.
+                if self._poly_points and is_duplicate_point(
+                        (scene_pt.x(), scene_pt.y()),
+                        (self._poly_points[-1].x(), self._poly_points[-1].y())):
+                    duplicate = True
                 self._poly_points.append(scene_pt)
                 self._poly_vertex_ids.append(None)
             self._active = ("poly", len(self._poly_points) - 1)
             self._clear_snap_indicator()
             self._redraw_polygon()
             self.polygonChanged.emit()
+            if duplicate:
+                self.duplicatePointWarning.emit(len(self._poly_points) - 1)
 
     def _set_marker_position(self, kind: str, index: int, scene_pt: QPointF,
                             *, emit: bool = True) -> None:
@@ -1109,6 +1133,7 @@ class CanvasView(QGraphicsView):
         elif kind == "poly" and 0 <= index < len(self._poly_points):
             self._poly_points[index] = scene_pt
             self._active = ("poly", index)
+            self._edge_warnings.clear()   # moved a vertex; warnings are stale (M17)
             vid = self._poly_vertex_ids[index] if index < len(self._poly_vertex_ids) else None
             if vid is not None:
                 # Moving an existing shared vertex: move it everywhere it's used.
@@ -1247,11 +1272,37 @@ class CanvasView(QGraphicsView):
             line.setZValue(5)
             self._scene.addItem(line)
             self._poly_items.append(line)
+        # Missing-corner warnings (M17): overlay flagged edges in dashed red so the
+        # suspect run stands out for review. Advisory only — the boundary is unchanged.
+        if self._edge_warnings:
+            by_index = {i: (a, b) for i, a, b in self._edge_list()}
+            warn_pen = QPen(_WARN_COLOR)
+            warn_pen.setWidth(5)
+            warn_pen.setCosmetic(True)
+            warn_pen.setStyle(Qt.PenStyle.DashLine)
+            for idx in self._edge_warnings:
+                if idx not in by_index:
+                    continue
+                a, b = by_index[idx]
+                line = QGraphicsLineItem(a.x(), a.y(), b.x(), b.y())
+                line.setPen(warn_pen)
+                line.setZValue(6)   # above the boundary edges (5), below markers (10)
+                self._scene.addItem(line)
+                self._poly_items.append(line)
         for i, p in enumerate(pts):
             active = self._active == ("poly", i)
             self._add_marker(self._poly_items, p, str(i + 1), color,
                              filled=True, active=active)
         self._apply_opacity(self._poly_items)
+
+    def set_edge_warnings(self, edge_indices) -> None:
+        """Highlight edges flagged as possibly skipping a corner (Milestone 17).
+        Pass an empty iterable to clear. Advisory overlay only; never edits points."""
+        self._edge_warnings = {int(i) for i in edge_indices}
+        self._redraw_polygon()
+
+    def edge_warnings(self) -> set[int]:
+        return set(self._edge_warnings)
 
     def _redraw_active(self) -> None:
         """Refresh only the highlight after selection changes (cheap enough to

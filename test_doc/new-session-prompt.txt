@@ -2,7 +2,7 @@ This is a continuing project, not a new one. Before doing anything:
 
 1. Read PROJECT_BRIEF.md in full.
 2. Check git log for the commit history — one commit per milestone so far
-   (M1 through M16 are done and confirmed).
+   (M1 through M17 are done and confirmed).
 3. Run the existing test suite and confirm it's green before making any
    changes.
 4. Skim src/core/, src/io/, src/ui/ structure to confirm it matches what
@@ -10,4 +10,4 @@ This is a continuing project, not a new one. Before doing anything:
 
 Summarize back to me: what milestone the project is actually at, and
 anything in the code that seems to contradict or go beyond what's written
-in PROJECT_BRIEF.md, before I give you the Milestone 17 prompt.
+in PROJECT_BRIEF.md, before I give you the Milestone 18 prompt.
